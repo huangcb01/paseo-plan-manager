@@ -17,10 +17,6 @@ export async function handleGetDashboard() {
     tools: status.tools,
     defaultPaths: status.defaultPaths,
     storagePath: planStore.root,
-    sidebarPlacement: {
-      exactSlotSupported: false as const,
-      message: "Paseo 当前只允许插件添加 Workspaces 上方的静态侧栏入口，未开放 Workspaces 下方的动态槽位。",
-    },
   };
 }
 

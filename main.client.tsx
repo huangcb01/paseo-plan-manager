@@ -1,4 +1,4 @@
-import { type PluginSurfaceProps, useRpc } from "@getpaseo/plugin";
+import { type PluginWorkspacePanelProps, useRpc } from "@getpaseo/plugin";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useMemo, useState } from "react";
 import {
@@ -142,7 +142,7 @@ function usageDetail(window: UsageWindow): string {
   return window.usedPercent !== undefined ? `${Math.round(window.usedPercent)}% 已使用` : "额度未知";
 }
 
-function createStyles(theme: PluginSurfaceProps["theme"], compact: boolean) {
+function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolean) {
   return StyleSheet.create({
     screen: {
       flex: 1,
@@ -253,22 +253,6 @@ function createStyles(theme: PluginSurfaceProps["theme"], compact: boolean) {
       color: theme.colors.foregroundMuted,
       fontSize: 11,
       marginTop: 2,
-    },
-    callout: {
-      borderWidth: 1,
-      borderColor: theme.colors.foregroundMuted,
-      padding: 12,
-      gap: 4,
-    },
-    calloutTitle: {
-      color: theme.colors.foreground,
-      fontWeight: "700",
-      fontSize: 12,
-    },
-    calloutText: {
-      color: theme.colors.foregroundMuted,
-      fontSize: 11,
-      lineHeight: 17,
     },
     notice: {
       borderLeftWidth: 3,
@@ -884,7 +868,7 @@ function PlanEditor({
   );
 }
 
-export function MainSurface({ theme, host, layout }: PluginSurfaceProps) {
+export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspacePanelProps) {
   const styles = useMemo(() => createStyles(theme, layout.compact), [theme, layout.compact]);
   const queryClient = useQueryClient();
   const dashboardRpc = useRpc(getDashboard) as (_input: Record<string, never>) => Promise<Dashboard>;
@@ -1045,13 +1029,6 @@ export function MainSurface({ theme, host, layout }: PluginSurfaceProps) {
               <Text style={styles.statValue}>60s</Text>
               <Text style={styles.statLabel}>自动刷新间隔</Text>
             </View>
-          </View>
-        ) : null}
-
-        {dashboard ? (
-          <View style={styles.callout}>
-            <Text style={styles.calloutTitle}>侧栏位置受 Paseo 插件 API 限制</Text>
-            <Text style={styles.calloutText}>{dashboard.sidebarPlacement.message}</Text>
           </View>
         ) : null}
 

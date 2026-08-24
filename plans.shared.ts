@@ -82,10 +82,6 @@ export const DashboardSchema = z.object({
     claudeSettings: z.string(),
   }),
   storagePath: z.string(),
-  sidebarPlacement: z.object({
-    exactSlotSupported: z.literal(false),
-    message: z.string(),
-  }),
 });
 
 export const SavePlanInputSchema = z.object({

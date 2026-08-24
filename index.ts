@@ -13,7 +13,7 @@ import {
   handleRefreshUsage,
   handleSavePlan,
 } from "./handlers.server";
-import { MainSurface } from "./main.client";
+import { CodingPlansWorkspacePanel } from "./main.client";
 
 export default function contribute(plugin: PluginContext) {
   plugin.handle(getDashboard, handleGetDashboard);
@@ -22,21 +22,21 @@ export default function contribute(plugin: PluginContext) {
   plugin.handle(refreshUsage, handleRefreshUsage);
   plugin.handle(applyPlan, handleApplyPlan);
 
-  plugin.addSurface("main", MainSurface);
-  plugin.addSidebarItem({
+  plugin.addWorkspacePanel({
     id: "coding-plans",
     title: "Coding Plans",
     icon: "Gauge",
-    surface: "main",
+    context: "workspace",
+    Component: CodingPlansWorkspacePanel,
   });
   plugin.addCommandCenterItem({
     id: "open-coding-plans",
     title: "Open Coding Plans",
     icon: "Gauge",
     keywords: ["quota", "usage", "codex", "glm", "kimi"],
-    context: "global",
-    onSelect({ openSurface }) {
-      openSurface("main");
+    context: "workspace",
+    onSelect({ openPanel }) {
+      openPanel("coding-plans");
     },
   });
   plugin.addCommandCenterItem({
@@ -44,9 +44,9 @@ export default function contribute(plugin: PluginContext) {
     title: "Open and refresh Coding Plan usage",
     icon: "RefreshCw",
     keywords: ["quota", "usage"],
-    context: "global",
-    onSelect({ openSurface }) {
-      openSurface("main");
+    context: "workspace",
+    onSelect({ openPanel }) {
+      openPanel("coding-plans");
     },
   });
   return () => {};

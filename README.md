@@ -13,13 +13,9 @@
 - 一键写入 Codex `auth.json` / `config.toml`，或 Claude Code `settings.json` 与 `~/.claude.json` onboarding 状态。
 - 检测 `opencode`、`codex`、`claude` 是否存在；插件不包含、下载或安装任何 CLI。
 
-## Paseo 侧栏限制
+## Workspace 标签页
 
-需求中的精确位置是 Workspaces 列表下方、“添加 project”按钮上方。Paseo 0.5.x 在该位置有内部 `SidebarCallout`，但当前插件 API 没有暴露它；`addSidebarItem` 也不支持自定义组件、动态文本、badge 或排序位置。
-
-因此本插件使用当前唯一受支持的实现：添加一个 **Coding Plans** 静态侧栏入口，点击后打开完整用量界面。Paseo 会把插件入口渲染在 Workspaces 上方。插件没有使用 DOM 注入或未公开内部模块，以免升级、移动端或暗色主题失效。
-
-要实现精确位置，需要 Paseo 上游新增类似 `addSidebarWidget` 的 contribution API；仅修改本插件无法做到。
+插件通过 Paseo Workspace Panel API 展示完整管理界面。打开后，**Coding Plans** 会作为标签出现在当前 Workspace 主区域，与 Agent 标签并列；它不再占用全局侧栏。
 
 ## 安装
 
@@ -38,7 +34,7 @@ npm run check
 paseo plugin reload coding-plan-manager
 ```
 
-也可通过 `Ctrl+K` / `Cmd+K` 搜索 **Open Coding Plans** 或 **Refresh Coding Plan usage**。
+安装后进入任意 Workspace，通过 `Ctrl+K` / `Cmd+K` 搜索 **Open Coding Plans** 或 **Open and refresh Coding Plan usage** 打开标签页。
 
 ## 添加 Plan
 
