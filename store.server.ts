@@ -1,0 +1,592 @@
+import { createHash, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import path from "node:path";
+import { readdir, unlink } from "node:fs/promises";
+import type {
+  Plan,
+  Provider,
+  SavePlanInput,
+  Target,
+  TargetModels,
+  UsageSnapshot,
+  ZhipuRegion,
+} from "./plans.shared";
+import {
+  atomicWriteFile,
+  captureFile,
+  ensurePrivateDirectory,
+  expandHome,
+  parseJsonObject,
+  paseoCodingPlanHome,
+  readTextIfExists,
+  restoreFile,
+} from "./file-utils.server";
+
+interface StoreState {
+  version: 1;
+  plans: Plan[];
+  activeTargets: Record<Target, string | null>;
+}
+
+export interface CodexSecret {
+  kind: "codex-auth";
+  auth: Record<string, unknown>;
+}
+
+export interface ApiKeySecret {
+  kind: "api-key";
+  apiKey: string;
+}
+
+export type PlanSecret = CodexSecret | ApiKeySecret;
+export interface PlanSnapshot {
+  plan: Plan;
+  secret: PlanSecret;
+}
+
+const EMPTY_TARGETS: Record<Target, string | null> = {
+  opencode: null,
+  codex: null,
+  claude: null,
+};
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function defaultModels(provider: Provider): TargetModels {
+  if (provider === "codex") {
+    return { opencode: "gpt-5.6-sol", codex: "gpt-5.6-sol", claude: "gpt-5.6-sol" };
+  }
+  if (provider === "zhipu") {
+    return { opencode: "glm-5.1", codex: "glm-5.3", claude: "glm-5.1" };
+  }
+  return {
+    opencode: "kimi-for-coding",
+    codex: "kimi-for-coding",
+    claude: "kimi-for-coding",
+  };
+}
+
+export function defaultCodexAuthPath(): string {
+  const codexHome = process.env.CODEX_HOME?.trim()
+    ? expandHome(process.env.CODEX_HOME)
+    : path.join(homedir(), ".codex");
+  return path.join(codexHome, "auth.json");
+}
+
+export function parseJwtPayload(token: string | undefined): Record<string, unknown> | undefined {
+  if (!token) return undefined;
+  const parts = token.split(".");
+  if (parts.length !== 3) return undefined;
+  try {
+    const payload: unknown = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return isObject(payload) ? payload : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function codexTokens(auth: Record<string, unknown>): Record<string, unknown> {
+  const tokens = auth.tokens;
+  if (!isObject(tokens)) throw new Error("Codex auth.json does not contain a tokens object");
+  if (typeof tokens.access_token !== "string" || !tokens.access_token) {
+    throw new Error("Codex auth.json does not contain an access token");
+  }
+  if (typeof tokens.refresh_token !== "string" || !tokens.refresh_token) {
+    throw new Error("Codex auth.json does not contain a refresh token");
+  }
+  return tokens;
+}
+
+export function codexAccountId(auth: Record<string, unknown>): string | undefined {
+  const tokens = codexTokens(auth);
+  if (typeof tokens.account_id === "string" && tokens.account_id) return tokens.account_id;
+
+  const claims = parseJwtPayload(
+    typeof tokens.id_token === "string" ? tokens.id_token : String(tokens.access_token),
+  );
+  if (!claims) return undefined;
+  if (typeof claims.chatgpt_account_id === "string") return claims.chatgpt_account_id;
+  const namespaced = claims["https://api.openai.com/auth"];
+  if (isObject(namespaced) && typeof namespaced.chatgpt_account_id === "string") {
+    return namespaced.chatgpt_account_id;
+  }
+  const organizations = claims.organizations;
+  if (Array.isArray(organizations) && isObject(organizations[0])) {
+    const id = organizations[0].id;
+    if (typeof id === "string") return id;
+  }
+  return undefined;
+}
+
+export function codexTokenIdentity(token: string | undefined): string | undefined {
+  const claims = parseJwtPayload(token);
+  if (!claims) return undefined;
+  const namespaced = claims["https://api.openai.com/auth"];
+  if (isObject(namespaced) && typeof namespaced.chatgpt_user_id === "string") {
+    return `user:${namespaced.chatgpt_user_id}`;
+  }
+  if (typeof claims.chatgpt_user_id === "string") return `user:${claims.chatgpt_user_id}`;
+  if (typeof claims.sub === "string") return `sub:${claims.sub}`;
+  return undefined;
+}
+
+export function codexIdentity(auth: Record<string, unknown>): string | undefined {
+  const tokens = codexTokens(auth);
+  return codexTokenIdentity(
+    typeof tokens.id_token === "string" ? tokens.id_token : undefined,
+  ) ?? codexTokenIdentity(
+    typeof tokens.access_token === "string" ? tokens.access_token : undefined,
+  );
+}
+
+export function codexGeneration(auth: Record<string, unknown>): number {
+  const tokens = codexTokens(auth);
+  const access = typeof tokens.access_token === "string" ? tokens.access_token : undefined;
+  const expires = Number(parseJwtPayload(access)?.exp);
+  const refreshed = Date.parse(typeof auth.last_refresh === "string" ? auth.last_refresh : "");
+  return Math.max(Number.isFinite(expires) ? expires * 1000 : 0, Number.isFinite(refreshed) ? refreshed : 0);
+}
+
+function credentialHint(provider: Provider, secret: PlanSecret, accountId?: string): string {
+  if (secret.kind === "codex-auth") {
+    const suffix = accountId ? accountId.slice(-8) : "account";
+    return `OAuth ...${suffix}`;
+  }
+  const suffix = secret.apiKey.slice(-4);
+  const fingerprint = createHash("sha256").update(secret.apiKey).digest("hex").slice(0, 6);
+  return `${provider === "zhipu" ? "GLM" : "Kimi"} ...${suffix} (${fingerprint})`;
+}
+
+function validatePlan(value: unknown): value is Plan {
+  if (!isObject(value)) return false;
+  if (typeof value.id !== "string" || typeof value.label !== "string") return false;
+  if (!(["codex", "zhipu", "kimi"] as unknown[]).includes(value.provider)) return false;
+  if (!isObject(value.models)) return false;
+  const models = value.models;
+  return ["opencode", "codex", "claude"].every((key) => typeof models[key] === "string");
+}
+
+function validateUsage(value: unknown): value is UsageSnapshot {
+  return (
+    isObject(value) &&
+    typeof value.planId === "string" &&
+    (value.status === "ok" || value.status === "error") &&
+    typeof value.fetchedAt === "string" &&
+    Array.isArray(value.windows)
+  );
+}
+
+export class PlanStore {
+  readonly root: string;
+  private queue: Promise<void> = Promise.resolve();
+  private initialization?: Promise<void>;
+
+  constructor(root = paseoCodingPlanHome()) {
+    this.root = root;
+  }
+
+  private get statePath(): string {
+    return path.join(this.root, "plans.json");
+  }
+
+  private get usagePath(): string {
+    return path.join(this.root, "usage-cache.json");
+  }
+
+  private secretPath(planId: string): string {
+    if (!/^[a-z0-9-]+$/.test(planId)) throw new Error("Invalid plan ID");
+    return path.join(this.root, "secrets", `${planId}.json`);
+  }
+
+  async initialize(): Promise<void> {
+    if (!this.initialization) {
+      this.initialization = (async () => {
+        const secretsDirectory = path.join(this.root, "secrets");
+        await ensurePrivateDirectory(this.root);
+        await ensurePrivateDirectory(secretsDirectory);
+
+        const stateText = await readTextIfExists(this.statePath);
+        let validPlanIds: Set<string> | undefined;
+        if (!stateText) {
+          validPlanIds = new Set();
+        } else {
+          try {
+            const parsed = parseJsonObject(stateText, this.statePath);
+            if (parsed.version === 1 && Array.isArray(parsed.plans) && parsed.plans.every(validatePlan)) {
+              validPlanIds = new Set(parsed.plans.map((plan) => plan.id));
+            }
+          } catch {
+            // Never delete credentials when the metadata file cannot be trusted.
+          }
+        }
+        if (validPlanIds) {
+          const entries = await readdir(secretsDirectory, { withFileTypes: true });
+          await Promise.all(entries.map(async (entry) => {
+            const match = entry.isFile() ? entry.name.match(/^([a-z0-9-]+)\.json$/) : undefined;
+            if (match && !validPlanIds.has(match[1])) {
+              await unlink(path.join(secretsDirectory, entry.name));
+            }
+          }));
+        }
+      })().catch((error) => {
+        this.initialization = undefined;
+        throw error;
+      });
+    }
+    await this.initialization;
+  }
+
+  private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.queue;
+    let release!: () => void;
+    this.queue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async readState(): Promise<StoreState> {
+    await this.initialize();
+    const text = await readTextIfExists(this.statePath);
+    if (!text) return { version: 1, plans: [], activeTargets: { ...EMPTY_TARGETS } };
+    const parsed = parseJsonObject(text, this.statePath);
+    if (parsed.version !== 1 || !Array.isArray(parsed.plans) || !parsed.plans.every(validatePlan)) {
+      throw new Error(`Unsupported or corrupt plan store: ${this.statePath}`);
+    }
+    const active = isObject(parsed.activeTargets) ? parsed.activeTargets : {};
+    return {
+      version: 1,
+      plans: parsed.plans,
+      activeTargets: {
+        opencode: typeof active.opencode === "string" ? active.opencode : null,
+        codex: typeof active.codex === "string" ? active.codex : null,
+        claude: typeof active.claude === "string" ? active.claude : null,
+      },
+    };
+  }
+
+  private async writeState(state: StoreState): Promise<void> {
+    await atomicWriteFile(this.statePath, `${JSON.stringify(state, null, 2)}\n`, 0o600);
+  }
+
+  async listPlans(): Promise<Plan[]> {
+    const state = await this.readState();
+    return [...state.plans].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+
+  async getPlan(planId: string): Promise<Plan> {
+    const plan = (await this.readState()).plans.find((candidate) => candidate.id === planId);
+    if (!plan) throw new Error("Coding Plan not found");
+    return plan;
+  }
+
+  async getActiveTargets(): Promise<Record<Target, string | null>> {
+    return { ...(await this.readState()).activeTargets };
+  }
+
+  async markActive(target: Target, planId: string): Promise<void> {
+    await this.exclusive(async () => {
+      const state = await this.readState();
+      if (!state.plans.some((plan) => plan.id === planId)) throw new Error("Coding Plan not found");
+      state.activeTargets[target] = planId;
+      await this.writeState(state);
+    });
+  }
+
+  private async readSecretFile(planId: string): Promise<PlanSecret> {
+    const text = await readTextIfExists(this.secretPath(planId), 1024 * 1024);
+    if (!text) throw new Error("Coding Plan credential is missing");
+    const parsed = parseJsonObject(text, "Coding Plan credential");
+    if (parsed.kind === "api-key" && typeof parsed.apiKey === "string" && parsed.apiKey) {
+      return { kind: "api-key", apiKey: parsed.apiKey };
+    }
+    if (parsed.kind === "codex-auth" && isObject(parsed.auth)) {
+      codexTokens(parsed.auth);
+      return { kind: "codex-auth", auth: parsed.auth };
+    }
+    throw new Error("Coding Plan credential has an unsupported format");
+  }
+
+  async readSecret(planId: string): Promise<PlanSecret> {
+    return this.readSecretFile(planId);
+  }
+
+  private async syncCodexSource(plan: Plan, secret: CodexSecret): Promise<CodexSecret> {
+    if (!plan.authFilePath) return secret;
+    try {
+      const sourceText = await readTextIfExists(plan.authFilePath, 1024 * 1024);
+      if (!sourceText) return secret;
+      const source = parseJsonObject(sourceText, "Codex auth.json");
+      codexTokens(source);
+      const storedIdentity = codexIdentity(secret.auth);
+      const sourceIdentity = codexIdentity(source);
+      if (!storedIdentity || !sourceIdentity || storedIdentity !== sourceIdentity) return secret;
+      if (codexGeneration(source) <= codexGeneration(secret.auth)) return secret;
+      const sourceTokens = codexTokens(source);
+      if (plan.accountId) sourceTokens.account_id = plan.accountId;
+      const next = { kind: "codex-auth" as const, auth: source };
+      await atomicWriteFile(
+        this.secretPath(plan.id),
+        `${JSON.stringify(next, null, 2)}\n`,
+        0o600,
+      );
+      return next;
+    } catch {
+      return secret;
+    }
+  }
+
+  async syncCodexSecretFromSource(planId: string): Promise<CodexSecret> {
+    return this.exclusive(async () => {
+      const state = await this.readState();
+      const plan = state.plans.find((candidate) => candidate.id === planId);
+      if (!plan || plan.provider !== "codex") throw new Error("Codex plan not found");
+      const secret = await this.readSecretFile(planId);
+      if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
+      return this.syncCodexSource(plan, secret);
+    });
+  }
+
+  async withPlanForApply<T>(
+    planId: string,
+    target: Target,
+    operation: (plan: Plan, secret: PlanSecret) => Promise<{
+      result: T;
+      applied: boolean;
+      updatedSecret?: PlanSecret;
+    }>,
+  ): Promise<T> {
+    return this.exclusive(async () => {
+      const state = await this.readState();
+      const plan = state.plans.find((candidate) => candidate.id === planId);
+      if (!plan) throw new Error("Coding Plan not found");
+      let secret = await this.readSecretFile(planId);
+      if (plan.provider === "codex") {
+        if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
+        secret = await this.syncCodexSource(plan, secret);
+      }
+      const outcome = await operation(plan, secret);
+      if (outcome.updatedSecret) {
+        await atomicWriteFile(
+          this.secretPath(plan.id),
+          `${JSON.stringify(outcome.updatedSecret, null, 2)}\n`,
+          0o600,
+        );
+      } else if (outcome.applied && secret.kind === "codex-auth") {
+        await atomicWriteFile(
+          this.secretPath(plan.id),
+          `${JSON.stringify(secret, null, 2)}\n`,
+          0o600,
+        );
+      }
+      if (outcome.applied) {
+        state.activeTargets[target] = plan.id;
+        await this.writeState(state);
+      }
+      return outcome.result;
+    });
+  }
+
+  async replaceCodexSecret(planId: string, auth: Record<string, unknown>): Promise<void> {
+    codexTokens(auth);
+    await this.exclusive(async () => {
+      const plan = (await this.readState()).plans.find((candidate) => candidate.id === planId);
+      if (!plan || plan.provider !== "codex") throw new Error("Plan is not a Codex plan");
+      await atomicWriteFile(
+        this.secretPath(planId),
+        `${JSON.stringify({ kind: "codex-auth", auth }, null, 2)}\n`,
+        0o600,
+      );
+    });
+  }
+
+  async savePlan(input: SavePlanInput): Promise<Plan> {
+    return this.exclusive(async () => {
+      const state = await this.readState();
+      const existing = input.id
+        ? state.plans.find((candidate) => candidate.id === input.id)
+        : undefined;
+      if (input.id && !existing) throw new Error("Coding Plan not found");
+
+      const id = existing?.id ?? `${input.provider}-${randomUUID()}`;
+      let secret: PlanSecret;
+      let authFilePath: string | undefined;
+      let accountId: string | undefined;
+      let region: ZhipuRegion | undefined;
+
+      if (input.provider === "codex") {
+        authFilePath = expandHome(input.authFilePath || existing?.authFilePath || defaultCodexAuthPath());
+        const text = await readTextIfExists(authFilePath, 1024 * 1024);
+        if (!text) throw new Error(`Codex auth file not found: ${authFilePath}`);
+        const auth = parseJsonObject(text, "Codex auth.json");
+        const tokens = codexTokens(auth);
+        accountId = input.accountId || codexAccountId(auth);
+        if (accountId) tokens.account_id = accountId;
+        secret = { kind: "codex-auth", auth };
+        if (existing?.provider === "codex") {
+          const current = await this.readSecretFile(existing.id);
+          if (
+            current.kind === "codex-auth" &&
+            codexIdentity(current.auth) &&
+            codexIdentity(current.auth) === codexIdentity(auth) &&
+            codexGeneration(current.auth) > codexGeneration(auth)
+          ) {
+            const preserved = structuredClone(current.auth);
+            const preservedTokens = codexTokens(preserved);
+            if (accountId) preservedTokens.account_id = accountId;
+            secret = { kind: "codex-auth", auth: preserved };
+          }
+        }
+      } else {
+        const providedKey = input.apiKey?.trim();
+        if (providedKey) {
+          secret = { kind: "api-key", apiKey: providedKey };
+        } else if (existing?.provider === input.provider) {
+          const current = await this.readSecretFile(existing.id);
+          if (current.kind !== "api-key") throw new Error("Enter an API key for this plan");
+          secret = current;
+        } else {
+          throw new Error("Enter an API key for this plan");
+        }
+        if (input.provider === "zhipu") region = input.region ?? existing?.region ?? "cn";
+      }
+
+      const defaults = defaultModels(input.provider);
+      const models: TargetModels = {
+        opencode: input.models.opencode.trim() || defaults.opencode,
+        codex: input.models.codex.trim() || defaults.codex,
+        claude: input.models.claude.trim() || defaults.claude,
+      };
+      const now = new Date().toISOString();
+      const plan: Plan = {
+        id,
+        label: input.label.trim(),
+        provider: input.provider,
+        credentialHint: credentialHint(input.provider, secret, accountId),
+        models,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        ...(region ? { region } : {}),
+        ...(authFilePath ? { authFilePath } : {}),
+        ...(accountId ? { accountId } : {}),
+      };
+
+      const secretPath = this.secretPath(id);
+      const previousSecret = await captureFile(secretPath);
+      await atomicWriteFile(secretPath, `${JSON.stringify(secret, null, 2)}\n`, 0o600);
+      const index = state.plans.findIndex((candidate) => candidate.id === id);
+      if (index >= 0) state.plans[index] = plan;
+      else state.plans.push(plan);
+      if (existing) {
+        for (const target of ["opencode", "codex", "claude"] as const) {
+          if (state.activeTargets[target] === id) state.activeTargets[target] = null;
+        }
+      }
+      try {
+        if (existing) {
+          const usage = (await this.readUsageCache()).filter((snapshot) => snapshot.planId !== id);
+          await this.writeUsageCache(usage);
+        }
+        await this.writeState(state);
+      } catch (error) {
+        try {
+          await restoreFile(secretPath, previousSecret);
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            "Failed to save Coding Plan metadata and restore its credential",
+          );
+        }
+        throw error;
+      }
+      return plan;
+    });
+  }
+
+  async deletePlan(planId: string): Promise<boolean> {
+    return this.exclusive(async () => {
+      const state = await this.readState();
+      const nextPlans = state.plans.filter((plan) => plan.id !== planId);
+      const existed = nextPlans.length !== state.plans.length;
+      state.plans = nextPlans;
+      for (const target of ["opencode", "codex", "claude"] as const) {
+        if (state.activeTargets[target] === planId) state.activeTargets[target] = null;
+      }
+      await this.writeState(state);
+      await unlink(this.secretPath(planId)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+
+      const usage = (await this.readUsageCache()).filter((snapshot) => snapshot.planId !== planId);
+      await this.writeUsageCache(usage);
+      return existed;
+    });
+  }
+
+  async readUsageCache(): Promise<UsageSnapshot[]> {
+    const text = await readTextIfExists(this.usagePath);
+    if (!text) return [];
+    const parsed: unknown = JSON.parse(text);
+    if (!Array.isArray(parsed) || !parsed.every(validateUsage)) {
+      throw new Error(`Corrupt usage cache: ${this.usagePath}`);
+    }
+    return parsed;
+  }
+
+  async writeUsageCache(usage: UsageSnapshot[]): Promise<void> {
+    await this.initialize();
+    await atomicWriteFile(this.usagePath, `${JSON.stringify(usage, null, 2)}\n`, 0o600);
+  }
+
+  async mergeUsageCache(
+    usage: UsageSnapshot[],
+    expectedUpdatedAt: ReadonlyMap<string, string>,
+  ): Promise<Set<string>> {
+    return this.exclusive(async () => {
+      const state = await this.readState();
+      const validPlans = new Set(
+        state.plans
+          .filter((plan) => expectedUpdatedAt.get(plan.id) === plan.updatedAt)
+          .map((plan) => plan.id),
+      );
+      const merged = new Map((await this.readUsageCache()).map((snapshot) => [snapshot.planId, snapshot]));
+      for (const snapshot of usage) {
+        if (validPlans.has(snapshot.planId)) merged.set(snapshot.planId, snapshot);
+      }
+      const currentPlanIds = new Set(state.plans.map((plan) => plan.id));
+      await this.writeUsageCache(
+        [...merged.values()].filter((snapshot) => currentPlanIds.has(snapshot.planId)),
+      );
+      return validPlans;
+    });
+  }
+
+  async snapshotPlans(planId?: string): Promise<PlanSnapshot[]> {
+    return this.exclusive(async () => {
+      const state = await this.readState();
+      const plans = planId
+        ? state.plans.filter((plan) => plan.id === planId)
+        : state.plans;
+      if (planId && plans.length === 0) throw new Error("Coding Plan not found");
+      const snapshots: PlanSnapshot[] = [];
+      for (const plan of plans) {
+        let secret = await this.readSecretFile(plan.id);
+        if (plan.provider === "codex") {
+          if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
+          secret = await this.syncCodexSource(plan, secret);
+        }
+        snapshots.push({ plan: structuredClone(plan), secret: structuredClone(secret) });
+      }
+      return snapshots.sort((left, right) => left.plan.createdAt.localeCompare(right.plan.createdAt));
+    });
+  }
+}
+
+export const planStore = new PlanStore();
