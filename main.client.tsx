@@ -364,7 +364,14 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       minWidth: 0,
       gap: 2,
     },
+    cardHeadingTop: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      gap: 7,
+    },
     cardTitleRow: {
+      flex: 1,
+      minWidth: 0,
       flexDirection: "row",
       alignItems: "center",
       flexWrap: "wrap",
@@ -385,82 +392,21 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       fontSize: 11,
     },
     cardActions: {
+      height: 20,
       flexDirection: "row",
       alignItems: "center",
       flexShrink: 0,
-      gap: 5,
+      gap: 4,
+    },
+    cardStale: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 8,
     },
     iconButton: {
-      width: 28,
-      height: 28,
+      width: 20,
+      height: 20,
       alignItems: "center",
       justifyContent: "center",
-    },
-    pencilIcon: {
-      width: 16,
-      height: 16,
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "center",
-      transform: [{ rotate: "-45deg" }],
-    },
-    pencilEraser: {
-      width: 3,
-      height: 4,
-      backgroundColor: theme.colors.foregroundMuted,
-    },
-    pencilShaft: {
-      width: 9,
-      height: 4,
-      backgroundColor: theme.colors.foreground,
-    },
-    pencilTip: {
-      width: 0,
-      height: 0,
-      borderTopWidth: 2,
-      borderBottomWidth: 2,
-      borderLeftWidth: 3,
-      borderTopColor: "transparent",
-      borderBottomColor: "transparent",
-      borderLeftColor: theme.colors.foreground,
-    },
-    trashIcon: {
-      width: 14,
-      height: 16,
-      alignItems: "center",
-    },
-    trashHandle: {
-      width: 6,
-      height: 2,
-      backgroundColor: theme.colors.foreground,
-    },
-    trashLid: {
-      width: 13,
-      height: 2,
-      marginBottom: 2,
-      backgroundColor: theme.colors.foreground,
-    },
-    trashBody: {
-      width: 10,
-      height: 10,
-      borderLeftWidth: 1,
-      borderRightWidth: 1,
-      borderBottomWidth: 1,
-      borderColor: theme.colors.foreground,
-      flexDirection: "row",
-      justifyContent: "space-evenly",
-      paddingTop: 2,
-    },
-    trashSlot: {
-      width: 1,
-      height: 5,
-      backgroundColor: theme.colors.foregroundMuted,
-    },
-    iconFillDanger: {
-      backgroundColor: theme.colors.statusDanger,
-    },
-    iconBorderDanger: {
-      borderColor: theme.colors.statusDanger,
     },
     tier: {
       color: theme.colors.accent,
@@ -834,11 +780,47 @@ function Button({
   );
 }
 
+// Lucide square-pen and trash-2 paths; licenses are recorded in THIRD_PARTY_NOTICES.md.
+const LUCIDE_ICON_PATHS = {
+  edit: [
+    "M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7",
+    "M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z",
+  ],
+  delete: [
+    "M10 11v6",
+    "M14 11v6",
+    "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6",
+    "M3 6h18",
+    "M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2",
+  ],
+} as const;
+
+function LucideCardIcon({ kind, color }: { kind: "edit" | "delete"; color: string }) {
+  return React.createElement(
+    "svg",
+    {
+      width: 12,
+      height: 12,
+      viewBox: "0 0 24 24",
+      fill: "none",
+      stroke: color,
+      strokeWidth: 1.1,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": true,
+      style: { pointerEvents: "none" },
+    },
+    ...LUCIDE_ICON_PATHS[kind].map((d) => React.createElement("path", { key: d, d })),
+  );
+}
+
 function CardIconButton({
   kind,
   label,
   onPress,
   styles,
+  color,
+  dangerColor,
   danger = false,
   disabled = false,
 }: {
@@ -846,6 +828,8 @@ function CardIconButton({
   label: string;
   onPress: () => void;
   styles: Styles;
+  color: string;
+  dangerColor: string;
   danger?: boolean;
   disabled?: boolean;
 }) {
@@ -854,7 +838,7 @@ function CardIconButton({
       accessibilityRole="button"
       accessibilityLabel={label}
       disabled={disabled}
-      hitSlop={4}
+      hitSlop={3}
       onPress={onPress}
       style={({ pressed }) => [
         styles.iconButton,
@@ -862,22 +846,7 @@ function CardIconButton({
         pressed && styles.buttonPressed,
       ]}
     >
-      {kind === "edit" ? (
-        <View style={styles.pencilIcon}>
-          <View style={styles.pencilEraser} />
-          <View style={styles.pencilShaft} />
-          <View style={styles.pencilTip} />
-        </View>
-      ) : (
-        <View style={styles.trashIcon}>
-          <View style={[styles.trashHandle, danger && styles.iconFillDanger]} />
-          <View style={[styles.trashLid, danger && styles.iconFillDanger]} />
-          <View style={[styles.trashBody, danger && styles.iconBorderDanger]}>
-            <View style={[styles.trashSlot, danger && styles.iconFillDanger]} />
-            <View style={[styles.trashSlot, danger && styles.iconFillDanger]} />
-          </View>
-        </View>
-      )}
+      <LucideCardIcon kind={kind} color={danger ? dangerColor : color} />
     </Pressable>
   );
 }
@@ -962,6 +931,8 @@ function PlanCard({
   actionsDisabled,
   confirmDelete,
   placeholderColor,
+  iconColor,
+  dangerColor,
   onRequestApply,
   onChangeApplyDraft,
   onConfirmApply,
@@ -978,6 +949,8 @@ function PlanCard({
   actionsDisabled: boolean;
   confirmDelete: boolean;
   placeholderColor: string;
+  iconColor: string;
+  dangerColor: string;
   onRequestApply: (target: Target) => void;
   onChangeApplyDraft: (draft: ApplyDraft) => void;
   onConfirmApply: () => void;
@@ -998,32 +971,38 @@ function PlanCard({
           <Text style={styles.providerMarkText}>{PROVIDER_MARKS[plan.provider]}</Text>
         </View>
         <View style={styles.cardHeading}>
-          <View style={styles.cardTitleRow}>
-            <Text style={styles.cardTitle}>{plan.label}</Text>
-            <Text style={styles.cardProvider}>{PROVIDER_LABELS[plan.provider]}</Text>
-            {usage?.planTier ? <Text style={styles.tier}>{usage.planTier}</Text> : null}
+          <View style={styles.cardHeadingTop}>
+            <View style={styles.cardTitleRow}>
+              <Text style={styles.cardTitle}>{plan.label}</Text>
+              <Text style={styles.cardProvider}>{PROVIDER_LABELS[plan.provider]}</Text>
+              {usage?.planTier ? <Text style={styles.tier}>{usage.planTier}</Text> : null}
+            </View>
+            <View style={styles.cardActions}>
+              {usage?.stale ? <Text style={styles.cardStale}>STALE</Text> : null}
+              <CardIconButton
+                kind="edit"
+                label={`编辑 ${plan.label}`}
+                onPress={onEdit}
+                styles={styles}
+                color={iconColor}
+                dangerColor={dangerColor}
+                disabled={actionsDisabled}
+              />
+              <CardIconButton
+                kind="delete"
+                label={confirmDelete ? `再次点击确认删除 ${plan.label}` : `删除 ${plan.label}`}
+                onPress={onDelete}
+                styles={styles}
+                color={iconColor}
+                dangerColor={dangerColor}
+                danger={confirmDelete}
+                disabled={actionsDisabled}
+              />
+            </View>
           </View>
           <Text style={styles.cardMeta}>
             {plan.credentialHint} · {plan.useProxy ? "PROXY" : "DIRECT"}
           </Text>
-        </View>
-        <View style={styles.cardActions}>
-          {usage?.stale ? <Text style={styles.cardMeta}>STALE</Text> : null}
-          <CardIconButton
-            kind="edit"
-            label={`编辑 ${plan.label}`}
-            onPress={onEdit}
-            styles={styles}
-            disabled={actionsDisabled}
-          />
-          <CardIconButton
-            kind="delete"
-            label={confirmDelete ? `再次点击确认删除 ${plan.label}` : `删除 ${plan.label}`}
-            onPress={onDelete}
-            styles={styles}
-            danger={confirmDelete}
-            disabled={actionsDisabled}
-          />
         </View>
       </View>
 
@@ -1676,6 +1655,8 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
                   actionsDisabled={actionsBusy}
                   confirmDelete={confirmDeleteId === plan.id}
                   placeholderColor={theme.colors.foregroundMuted}
+                  iconColor={theme.colors.foreground}
+                  dangerColor={theme.colors.statusDanger}
                   onRequestApply={(target) => {
                     setEditor(null);
                     setConfirmDeleteId(null);
