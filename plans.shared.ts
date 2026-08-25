@@ -4,12 +4,7 @@ import { z } from "zod";
 export const ProviderSchema = z.enum(["codex", "zhipu", "kimi"]);
 export const TargetSchema = z.enum(["opencode", "codex", "claude"]);
 export const ZhipuRegionSchema = z.enum(["cn", "global", "cn-dev"]);
-
-export const TargetModelsSchema = z.object({
-  opencode: z.string(),
-  codex: z.string(),
-  claude: z.string(),
-});
+export const CodexAuthModeSchema = z.enum(["path", "content"]);
 
 export const PlanSchema = z.object({
   id: z.string(),
@@ -19,7 +14,7 @@ export const PlanSchema = z.object({
   authFilePath: z.string().optional(),
   accountId: z.string().optional(),
   credentialHint: z.string(),
-  models: TargetModelsSchema,
+  useProxy: z.boolean(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -89,10 +84,12 @@ export const SavePlanInputSchema = z.object({
   label: z.string().trim().min(1).max(100),
   provider: ProviderSchema,
   region: ZhipuRegionSchema.optional(),
+  codexAuthMode: CodexAuthModeSchema.optional(),
   authFilePath: z.string().trim().max(4096).optional(),
+  authJsonContent: z.string().max(512 * 1024).optional(),
   accountId: z.string().trim().max(256).optional(),
   apiKey: z.string().max(8192).optional(),
-  models: TargetModelsSchema,
+  useProxy: z.boolean().optional(),
 });
 
 export const getDashboard = defineRpc({
@@ -121,14 +118,18 @@ export const refreshUsage = defineRpc({
 
 export const applyPlan = defineRpc({
   name: "coding-plans.target.apply",
-  input: z.object({ planId: z.string(), target: TargetSchema }),
+  input: z.object({
+    planId: z.string(),
+    target: TargetSchema,
+    model: z.string().trim().min(1).max(256),
+  }),
   output: ApplyPlanResultSchema,
 });
 
 export type Provider = z.infer<typeof ProviderSchema>;
 export type Target = z.infer<typeof TargetSchema>;
 export type ZhipuRegion = z.infer<typeof ZhipuRegionSchema>;
-export type TargetModels = z.infer<typeof TargetModelsSchema>;
+export type CodexAuthMode = z.infer<typeof CodexAuthModeSchema>;
 export type Plan = z.infer<typeof PlanSchema>;
 export type SavePlanInput = z.infer<typeof SavePlanInputSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;

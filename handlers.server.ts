@@ -32,6 +32,6 @@ export async function handleRefreshUsage({ planId }: { planId?: string }) {
   return { usage: await refreshUsageSnapshots(planId) };
 }
 
-export async function handleApplyPlan({ planId, target }: { planId: string; target: Target }) {
-  return applyPlanToTarget(planId, target);
+export async function handleApplyPlan({ planId, target, model }: { planId: string; target: Target; model: string }) {
+  return applyPlanToTarget(planId, target, model);
 }

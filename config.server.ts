@@ -150,21 +150,21 @@ function editJsonc(
   return result.endsWith(eol) ? result : `${result}${eol}`;
 }
 
-export function patchOpenCodeConfig(text: string | undefined, plan: Plan): string {
+export function patchOpenCodeConfig(text: string | undefined, plan: Plan, selectedModel: string): string {
   const source = text?.trim() ? text : "{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}\n";
   const parsed = jsoncValue(source, "OpenCode config");
   if (parsed.provider !== undefined && !isObject(parsed.provider)) {
     throw new Error("OpenCode config.provider must be an object");
   }
 
+  const model = nonEmpty(selectedModel, "OpenCode model");
   if (plan.provider === "codex") {
     return editJsonc(source, [
-      { path: ["model"], value: `openai/${nonEmpty(plan.models.opencode, "OpenCode model")}` },
+      { path: ["model"], value: `openai/${model}` },
     ]);
   }
 
   const projection = providerProjection(plan);
-  const model = nonEmpty(plan.models.opencode, "OpenCode model");
   const providerConfig = {
     npm: projection.opencode.npm,
     name: projection.displayName,
@@ -367,6 +367,7 @@ function upsertRootTomlKeys(
 export function patchCodexConfig(
   text: string | undefined,
   plan: Plan,
+  selectedModel: string,
   options: { apiKey?: string; modelCatalogPath?: string } = {},
 ): string {
   const source = text ?? "";
@@ -375,7 +376,7 @@ export function patchCodexConfig(
     throw new Error("Codex config with multiline TOML strings cannot be safely patched");
   }
   let result = removeManagedToml(source);
-  const model = nonEmpty(plan.models.codex, "Codex model");
+  const model = nonEmpty(selectedModel, "Codex model");
   if (plan.provider === "codex") {
     const updated = upsertRootTomlKeys(result, {
       model_provider: "openai",
@@ -419,6 +420,7 @@ export function patchClaudeSettings(
   text: string | undefined,
   plan: Plan,
   apiKey: string,
+  selectedModel: string,
 ): string {
   if (plan.provider === "codex") {
     throw new Error("Claude Code cannot use a ChatGPT Codex OAuth plan without a protocol-conversion proxy");
@@ -429,7 +431,7 @@ export function patchClaudeSettings(
   }
   const env = isObject(settings.env) ? { ...settings.env } : {};
   const projection = providerProjection(plan);
-  const model = nonEmpty(plan.models.claude, "Claude model");
+  const model = nonEmpty(selectedModel, "Claude model");
   const contextTokens = plan.provider === "kimi" && /^(k3|k3\[1m\])$/.test(model)
     ? "1048576"
     : projection.claude.contextTokens;
@@ -460,8 +462,8 @@ export function patchClaudeState(text: string | undefined, plan: Plan): string {
   return `${JSON.stringify(state, null, 2)}\n`;
 }
 
-export function codexModelCatalog(plan: Plan): string {
-  const model = nonEmpty(plan.models.codex, "Codex model");
+export function codexModelCatalog(selectedModel: string): string {
+  const model = nonEmpty(selectedModel, "Codex model");
   const contextWindow = model === "glm-5.3" ? 1_048_576 : 204_800;
   return `${JSON.stringify({
     models: [
@@ -604,7 +606,12 @@ async function writePair(
   }
 }
 
-async function applyOpenCode(plan: Plan, secret: PlanSecret, installed: boolean): Promise<ApplyResult> {
+async function applyOpenCode(
+  plan: Plan,
+  secret: PlanSecret,
+  model: string,
+  installed: boolean,
+): Promise<ApplyResult> {
   if (process.env.OPENCODE_CONFIG_CONTENT) {
     throw new Error("OPENCODE_CONFIG_CONTENT overrides files; refusing an ineffective switch");
   }
@@ -621,7 +628,7 @@ async function applyOpenCode(plan: Plan, secret: PlanSecret, installed: boolean)
     if (secret.kind !== "codex-auth") throw new Error("Codex OAuth credential is missing");
     absorbOpenCodeOAuth(plan, secret, authText);
   }
-  const nextConfig = patchOpenCodeConfig(configText, plan);
+  const nextConfig = patchOpenCodeConfig(configText, plan, model);
   const nextAuth = patchOpenCodeAuth(authText, plan, secret);
   await writePair(authPath, nextAuth, configPath, nextConfig, {
     expectedFirst: { text: authText },
@@ -644,7 +651,12 @@ async function applyOpenCode(plan: Plan, secret: PlanSecret, installed: boolean)
   };
 }
 
-async function applyCodex(plan: Plan, secret: PlanSecret, installed: boolean): Promise<ApplyResult> {
+async function applyCodex(
+  plan: Plan,
+  secret: PlanSecret,
+  model: string,
+  installed: boolean,
+): Promise<ApplyResult> {
   const directory = codexDirectory();
   const configPath = path.join(directory, "config.toml");
   const authPath = path.join(directory, "auth.json");
@@ -674,7 +686,7 @@ async function applyCodex(plan: Plan, secret: PlanSecret, installed: boolean): P
     const tokens = codexTokens(auth);
     if (plan.accountId) tokens.account_id = plan.accountId;
     const nextAuth = `${JSON.stringify(auth, null, 2)}\n`;
-    const nextConfig = patchCodexConfig(configText, plan);
+    const nextConfig = patchCodexConfig(configText, plan, model);
     if (!installed) warnings.push("未检测到 Codex；仅写入配置，没有安装 Codex。");
     await writePair(authPath, nextAuth, configPath, nextConfig, {
       expectedFirst: { text: currentAuthText },
@@ -706,11 +718,11 @@ async function applyCodex(plan: Plan, secret: PlanSecret, installed: boolean): P
   }
   if (secret.kind !== "api-key") throw new Error("API key is missing");
   const catalogPath = path.join(directory, "paseo-coding-plan-models.json");
-  const nextConfig = patchCodexConfig(configText, plan, {
+  const nextConfig = patchCodexConfig(configText, plan, model, {
     apiKey: secret.apiKey,
     modelCatalogPath: catalogPath,
   });
-  await writePair(catalogPath, codexModelCatalog(plan), configPath, nextConfig, {
+  await writePair(catalogPath, codexModelCatalog(model), configPath, nextConfig, {
     secondMode: 0o600,
     expectedSecond: { text: configText },
   });
@@ -727,7 +739,12 @@ async function applyCodex(plan: Plan, secret: PlanSecret, installed: boolean): P
   };
 }
 
-async function applyClaude(plan: Plan, secret: PlanSecret, installed: boolean): Promise<ApplyResult> {
+async function applyClaude(
+  plan: Plan,
+  secret: PlanSecret,
+  model: string,
+  installed: boolean,
+): Promise<ApplyResult> {
   if (plan.provider === "codex") {
     return {
       planId: plan.id,
@@ -747,7 +764,7 @@ async function applyClaude(plan: Plan, secret: PlanSecret, installed: boolean): 
     readTextIfExists(settingsPath),
     readTextIfExists(statePath),
   ]);
-  const nextSettings = patchClaudeSettings(settingsText, plan, secret.apiKey);
+  const nextSettings = patchClaudeSettings(settingsText, plan, secret.apiKey, model);
   const nextState = patchClaudeState(stateText, plan);
   await writePair(statePath, nextState, settingsPath, nextSettings, {
     secondMode: 0o600,
@@ -772,16 +789,18 @@ async function applyClaude(plan: Plan, secret: PlanSecret, installed: boolean): 
 export async function applyPlanToTarget(
   planId: string,
   target: Target,
+  model: string,
   store: PlanStore = planStore,
 ): Promise<ApplyResult> {
+  const selectedModel = nonEmpty(model, "Target model");
   const status = await toolsAndPaths();
   const installed = status.tools[target].installed;
   return store.withPlanForApply(planId, target, async (plan, secret) => {
     const result = target === "opencode"
-      ? await applyOpenCode(plan, secret, installed)
+      ? await applyOpenCode(plan, secret, selectedModel, installed)
       : target === "codex"
-        ? await applyCodex(plan, secret, installed)
-        : await applyClaude(plan, secret, installed);
+        ? await applyCodex(plan, secret, selectedModel, installed)
+        : await applyClaude(plan, secret, selectedModel, installed);
     return { result, applied: result.applied };
   });
 }

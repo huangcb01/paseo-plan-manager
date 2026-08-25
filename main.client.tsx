@@ -17,12 +17,12 @@ import {
   refreshUsage,
   savePlan,
   type ApplyPlanResult,
+  type CodexAuthMode,
   type Dashboard,
   type Plan,
   type Provider,
   type SavePlanInput,
   type Target,
-  type TargetModels,
   type UsageSnapshot,
   type UsageWindow,
   type ZhipuRegion,
@@ -33,10 +33,18 @@ interface EditorState {
   provider: Provider;
   label: string;
   region: ZhipuRegion;
+  codexAuthMode: CodexAuthMode;
   authFilePath: string;
+  authJsonContent: string;
   accountId: string;
   apiKey: string;
-  models: TargetModels;
+  useProxy: boolean;
+}
+
+interface ApplyDraft {
+  planId: string;
+  target: Target;
+  model: string;
 }
 
 interface NoticeState {
@@ -63,14 +71,10 @@ const PROVIDER_MARKS: Record<Provider, string> = {
   kimi: "KM",
 };
 
-function modelsFor(provider: Provider): TargetModels {
-  if (provider === "codex") {
-    return { opencode: "gpt-5.6-sol", codex: "gpt-5.6-sol", claude: "gpt-5.6-sol" };
-  }
-  if (provider === "zhipu") {
-    return { opencode: "glm-5.1", codex: "glm-5.3", claude: "glm-5.1" };
-  }
-  return { opencode: "kimi-for-coding", codex: "kimi-for-coding", claude: "kimi-for-coding" };
+function defaultModelFor(provider: Provider, target: Target): string {
+  if (provider === "codex") return "gpt-5.6-sol";
+  if (provider === "zhipu") return target === "codex" ? "glm-5.3" : "glm-5.1";
+  return "kimi-for-coding";
 }
 
 function emptyEditor(provider: Provider, dashboard?: Dashboard): EditorState {
@@ -78,23 +82,27 @@ function emptyEditor(provider: Provider, dashboard?: Dashboard): EditorState {
     provider,
     label: "",
     region: "cn",
+    codexAuthMode: "path",
     authFilePath: provider === "codex" ? dashboard?.defaultPaths.codexAuth ?? "~/.codex/auth.json" : "",
+    authJsonContent: "",
     accountId: "",
     apiKey: "",
-    models: modelsFor(provider),
+    useProxy: provider === "codex",
   };
 }
 
-function editorFor(plan: Plan): EditorState {
+function editorFor(plan: Plan, dashboard?: Dashboard): EditorState {
   return {
     id: plan.id,
     provider: plan.provider,
     label: plan.label,
     region: plan.region ?? "cn",
-    authFilePath: plan.authFilePath ?? "",
+    codexAuthMode: plan.authFilePath ? "path" : "content",
+    authFilePath: plan.authFilePath ?? dashboard?.defaultPaths.codexAuth ?? "~/.codex/auth.json",
+    authJsonContent: "",
     accountId: plan.accountId ?? "",
     apiKey: "",
-    models: plan.models,
+    useProxy: plan.useProxy,
   };
 }
 
@@ -158,12 +166,18 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     },
     header: {
       flexDirection: compact ? "column" : "row",
+      flexWrap: "wrap",
       alignItems: compact ? "stretch" : "flex-end",
       justifyContent: "space-between",
       gap: 14,
       paddingBottom: 18,
       borderBottomWidth: 1,
       borderBottomColor: theme.colors.foregroundMuted,
+    },
+    headerCopy: {
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: compact ? 0 : 320,
     },
     eyebrow: {
       color: theme.colors.accent,
@@ -196,6 +210,8 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       flexDirection: "row",
       alignItems: "center",
       flexWrap: "wrap",
+      flexShrink: 0,
+      maxWidth: "100%",
       gap: 8,
     },
     button: {
@@ -414,10 +430,68 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       padding: compact ? 14 : 18,
       gap: 15,
     },
+    applyConfigurator: {
+      borderTopWidth: 1,
+      borderTopColor: theme.colors.foregroundMuted,
+      paddingTop: 13,
+      gap: 11,
+    },
     editorTitle: {
       color: theme.colors.foreground,
       fontSize: 17,
       fontWeight: "800",
+    },
+    proxyControl: {
+      flexDirection: compact ? "column" : "row",
+      alignItems: compact ? "stretch" : "center",
+      justifyContent: "space-between",
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      padding: 12,
+      gap: 12,
+    },
+    proxyCopy: {
+      flex: 1,
+      minWidth: 0,
+      gap: 3,
+    },
+    proxyTitle: {
+      color: theme.colors.foreground,
+      fontSize: 12,
+      fontWeight: "800",
+    },
+    proxyToggle: {
+      flexDirection: "row",
+      alignItems: "center",
+      alignSelf: compact ? "flex-start" : "center",
+      gap: 8,
+    },
+    proxyTrack: {
+      width: 42,
+      height: 24,
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      padding: 3,
+      justifyContent: "center",
+    },
+    proxyTrackActive: {
+      borderColor: theme.colors.accent,
+      backgroundColor: theme.colors.accent,
+    },
+    proxyThumb: {
+      width: 16,
+      height: 16,
+      backgroundColor: theme.colors.foregroundMuted,
+      alignSelf: "flex-start",
+    },
+    proxyThumbActive: {
+      backgroundColor: theme.colors.accentForeground,
+      alignSelf: "flex-end",
+    },
+    proxyStatus: {
+      color: theme.colors.foreground,
+      fontSize: 11,
+      fontWeight: "700",
     },
     providerPicker: {
       flexDirection: "row",
@@ -444,17 +518,19 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     },
     fields: {
       flexDirection: compact ? "column" : "row",
-      flexWrap: "wrap",
+      flexWrap: compact ? "nowrap" : "wrap",
       gap: 11,
     },
     field: {
-      minWidth: compact ? "100%" : 260,
-      flexGrow: 1,
-      flexBasis: compact ? "100%" : "31%",
+      minWidth: compact ? 0 : 260,
+      width: compact ? "100%" : undefined,
+      flexGrow: compact ? 0 : 1,
+      flexBasis: compact ? "auto" : "31%",
       gap: 5,
     },
     fieldWide: {
-      flexBasis: compact ? "100%" : "64%",
+      width: compact ? "100%" : undefined,
+      flexBasis: compact ? "auto" : "64%",
     },
     fieldLabel: {
       color: theme.colors.foregroundMuted,
@@ -471,6 +547,10 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       paddingHorizontal: 10,
       paddingVertical: 8,
       fontSize: 12,
+    },
+    inputMultiline: {
+      minHeight: 180,
+      fontFamily: "monospace",
     },
     empty: {
       borderWidth: 1,
@@ -552,6 +632,8 @@ function Field({
   placeholderColor,
   secure = false,
   wide = false,
+  disabled = false,
+  multiline = false,
 }: {
   label: string;
   value: string;
@@ -561,20 +643,27 @@ function Field({
   placeholderColor: string;
   secure?: boolean;
   wide?: boolean;
+  disabled?: boolean;
+  multiline?: boolean;
 }) {
   return (
     <View style={[styles.field, wide && styles.fieldWide]}>
       <Text style={styles.fieldLabel}>{label}</Text>
       <TextInput
         accessibilityLabel={label}
+        accessibilityState={{ disabled }}
         value={value}
         onChangeText={onChangeText}
         placeholder={placeholder}
         placeholderTextColor={placeholderColor}
         secureTextEntry={secure}
+        editable={!disabled}
+        multiline={multiline}
+        numberOfLines={multiline ? 10 : 1}
+        textAlignVertical={multiline ? "top" : "center"}
         autoCapitalize="none"
         autoCorrect={false}
-        style={styles.input}
+        style={[styles.input, multiline && styles.inputMultiline, disabled && styles.buttonDisabled]}
       />
     </View>
   );
@@ -605,9 +694,14 @@ function PlanCard({
   dashboard,
   styles,
   applying,
+  applyDraft,
   actionsDisabled,
   confirmDelete,
-  onApply,
+  placeholderColor,
+  onRequestApply,
+  onChangeApplyModel,
+  onConfirmApply,
+  onCancelApply,
   onEdit,
   onDelete,
 }: {
@@ -616,9 +710,14 @@ function PlanCard({
   dashboard: Dashboard;
   styles: Styles;
   applying?: Target;
+  applyDraft?: ApplyDraft;
   actionsDisabled: boolean;
   confirmDelete: boolean;
-  onApply: (target: Target) => void;
+  placeholderColor: string;
+  onRequestApply: (target: Target) => void;
+  onChangeApplyModel: (model: string) => void;
+  onConfirmApply: () => void;
+  onCancelApply: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -633,7 +732,9 @@ function PlanCard({
         </View>
         <View style={styles.cardHeading}>
           <Text style={styles.cardTitle}>{plan.label}</Text>
-          <Text style={styles.cardMeta}>{PROVIDER_LABELS[plan.provider]} · {plan.credentialHint}</Text>
+          <Text style={styles.cardMeta}>
+            {PROVIDER_LABELS[plan.provider]} · {plan.credentialHint} · {plan.useProxy ? "PROXY" : "DIRECT"}
+          </Text>
           {usage?.planTier ? <Text style={styles.tier}>{usage.planTier}</Text> : null}
         </View>
         {usage?.stale ? <Text style={styles.cardMeta}>STALE</Text> : null}
@@ -674,7 +775,7 @@ function PlanCard({
                 : supported
                   ? `配置到 ${TARGET_LABELS[target]}`
                   : `${TARGET_LABELS[target]}（需代理）`}
-              onPress={() => onApply(target)}
+              onPress={() => onRequestApply(target)}
               styles={styles}
               primary={target === "opencode"}
               disabled={actionsDisabled || !supported}
@@ -682,6 +783,39 @@ function PlanCard({
           );
         })}
       </View>
+      {applyDraft ? (
+        <View style={styles.applyConfigurator}>
+          <View>
+            <Text style={styles.sectionTitle}>配置到 {TARGET_LABELS[applyDraft.target]}</Text>
+            <Text style={styles.muted}>模型仅用于本次配置写入，不会保存到 Coding Plan。</Text>
+          </View>
+          <Field
+            label="目标模型"
+            value={applyDraft.model}
+            onChangeText={onChangeApplyModel}
+            placeholder="输入目标工具支持的模型 ID"
+            styles={styles}
+            placeholderColor={placeholderColor}
+            wide
+            disabled={Boolean(applying)}
+          />
+          <View style={styles.row}>
+            <Button
+              label="取消"
+              onPress={onCancelApply}
+              styles={styles}
+              disabled={actionsDisabled}
+            />
+            <Button
+              label={applying === applyDraft.target ? "写入中..." : `确认配置到 ${TARGET_LABELS[applyDraft.target]}`}
+              onPress={onConfirmApply}
+              styles={styles}
+              primary
+              disabled={actionsDisabled || !applyDraft.model.trim()}
+            />
+          </View>
+        </View>
+      ) : null}
       <View style={styles.row}>
         <Button label="编辑 / 重新导入" onPress={onEdit} styles={styles} disabled={actionsDisabled} />
         <Button
@@ -717,9 +851,6 @@ function PlanEditor({
     if (editor.id) return;
     setEditor({ ...emptyEditor(provider), label: editor.label });
   }
-  function setModel(target: Target, value: string) {
-    setEditor({ ...editor, models: { ...editor.models, [target]: value } });
-  }
   return (
     <View style={styles.editor}>
       <View style={styles.sectionHeader}>
@@ -737,13 +868,13 @@ function PlanEditor({
             <Pressable
               key={provider}
               accessibilityRole="button"
-              accessibilityState={{ selected, disabled: Boolean(editor.id) }}
-              disabled={Boolean(editor.id)}
+              accessibilityState={{ selected, disabled: Boolean(editor.id) || saving }}
+              disabled={Boolean(editor.id) || saving}
               onPress={() => selectProvider(provider)}
               style={({ pressed }) => [
                 styles.providerOption,
                 selected && styles.providerOptionSelected,
-                editor.id && !selected && styles.buttonDisabled,
+                (saving || (editor.id && !selected)) && styles.buttonDisabled,
                 pressed && styles.buttonPressed,
               ]}
             >
@@ -755,6 +886,32 @@ function PlanEditor({
         })}
       </View>
 
+      <View style={styles.proxyControl}>
+        <View style={styles.proxyCopy}>
+          <Text style={styles.proxyTitle}>用量查询代理</Text>
+          <Text style={styles.muted}>
+            开启后使用 Paseo daemon 的 HTTPS_PROXY / HTTP_PROXY，并遵守 NO_PROXY。
+          </Text>
+        </View>
+        <Pressable
+          accessibilityRole="switch"
+          accessibilityLabel="用量查询代理"
+          accessibilityState={{ checked: editor.useProxy, disabled: saving }}
+          disabled={saving}
+          onPress={() => setEditor({ ...editor, useProxy: !editor.useProxy })}
+          style={({ pressed }) => [
+            styles.proxyToggle,
+            saving && styles.buttonDisabled,
+            pressed && styles.buttonPressed,
+          ]}
+        >
+          <View style={[styles.proxyTrack, editor.useProxy && styles.proxyTrackActive]}>
+            <View style={[styles.proxyThumb, editor.useProxy && styles.proxyThumbActive]} />
+          </View>
+          <Text style={styles.proxyStatus}>{editor.useProxy ? "使用代理" : "直连"}</Text>
+        </Pressable>
+      </View>
+
       <View style={styles.fields}>
         <Field
           label="显示名称"
@@ -763,18 +920,68 @@ function PlanEditor({
           placeholder="例如：工作账号 Pro"
           styles={styles}
           placeholderColor={placeholderColor}
+          disabled={saving}
         />
         {editor.provider === "codex" ? (
           <>
-            <Field
-              label="Codex auth.json 路径"
-              value={editor.authFilePath}
-              onChangeText={(authFilePath) => setEditor({ ...editor, authFilePath })}
-              placeholder="~/.codex/auth.json"
-              styles={styles}
-              placeholderColor={placeholderColor}
-              wide
-            />
+            <View style={[styles.field, styles.fieldWide]}>
+              <Text style={styles.fieldLabel}>auth.json 导入方式</Text>
+              <View style={styles.providerPicker}>
+                {([
+                  ["path", "从路径读取"],
+                  ["content", "直接输入 JSON"],
+                ] as const).map(([mode, label]) => {
+                  const selected = editor.codexAuthMode === mode;
+                  return (
+                    <Pressable
+                      key={mode}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected, disabled: saving }}
+                      disabled={saving}
+                      onPress={() => setEditor({
+                        ...editor,
+                        codexAuthMode: mode,
+                        ...(mode === "path" ? { authJsonContent: "" } : {}),
+                      })}
+                      style={({ pressed }) => [
+                        styles.providerOption,
+                        selected && styles.providerOptionSelected,
+                        saving && styles.buttonDisabled,
+                        pressed && styles.buttonPressed,
+                      ]}
+                    >
+                      <Text style={[styles.providerOptionText, selected && styles.providerOptionTextSelected]}>
+                        {label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+            {editor.codexAuthMode === "path" ? (
+              <Field
+                label="Codex auth.json 路径"
+                value={editor.authFilePath}
+                onChangeText={(authFilePath) => setEditor({ ...editor, authFilePath })}
+                placeholder="~/.codex/auth.json"
+                styles={styles}
+                placeholderColor={placeholderColor}
+                wide
+                disabled={saving}
+              />
+            ) : (
+              <Field
+                label={editor.id ? "auth.json 内容（留空表示保留现有凭据）" : "auth.json 内容"}
+                value={editor.authJsonContent}
+                onChangeText={(authJsonContent) => setEditor({ ...editor, authJsonContent })}
+                placeholder={'{\n  "tokens": { ... }\n}'}
+                styles={styles}
+                placeholderColor={placeholderColor}
+                wide
+                multiline
+                disabled={saving}
+              />
+            )}
             <Field
               label="ChatGPT Account ID（可选）"
               value={editor.accountId}
@@ -782,6 +989,7 @@ function PlanEditor({
               placeholder="留空则从 token 读取"
               styles={styles}
               placeholderColor={placeholderColor}
+              disabled={saving}
             />
           </>
         ) : (
@@ -794,6 +1002,7 @@ function PlanEditor({
             placeholderColor={placeholderColor}
             secure
             wide
+            disabled={saving}
           />
         )}
       </View>
@@ -812,11 +1021,13 @@ function PlanEditor({
                 <Pressable
                   key={region}
                   accessibilityRole="button"
-                  accessibilityState={{ selected }}
+                  accessibilityState={{ selected, disabled: saving }}
+                  disabled={saving}
                   onPress={() => setEditor({ ...editor, region })}
                   style={({ pressed }) => [
                     styles.providerOption,
                     selected && styles.providerOptionSelected,
+                    saving && styles.buttonDisabled,
                     pressed && styles.buttonPressed,
                   ]}
                 >
@@ -828,40 +1039,21 @@ function PlanEditor({
         </View>
       ) : null}
 
-      <View>
-        <Text style={styles.sectionTitle}>目标模型</Text>
-        <Text style={styles.muted}>每个工具可使用不同模型 ID；切换时覆盖该 provider 当前选择。</Text>
-      </View>
-      <View style={styles.fields}>
-        <Field
-          label="OpenCode model"
-          value={editor.models.opencode}
-          onChangeText={(value) => setModel("opencode", value)}
-          styles={styles}
-          placeholderColor={placeholderColor}
-        />
-        <Field
-          label="Codex model"
-          value={editor.models.codex}
-          onChangeText={(value) => setModel("codex", value)}
-          styles={styles}
-          placeholderColor={placeholderColor}
-        />
-        <Field
-          label="Claude Code model"
-          value={editor.models.claude}
-          onChangeText={(value) => setModel("claude", value)}
-          styles={styles}
-          placeholderColor={placeholderColor}
-        />
-      </View>
       <View style={styles.row}>
         <Button
           label={saving ? "保存中..." : editor.id ? "保存并重新导入凭据" : "保存 Plan"}
           onPress={onSave}
           styles={styles}
           primary
-          disabled={saving || !editor.label.trim()}
+          disabled={
+            saving ||
+            !editor.label.trim() ||
+            (editor.provider === "codex" &&
+              ((editor.codexAuthMode === "path" && !editor.authFilePath.trim()) ||
+                (editor.codexAuthMode === "content" &&
+                  !editor.id &&
+                  !editor.authJsonContent.trim())))
+          }
         />
       </View>
     </View>
@@ -869,16 +1061,19 @@ function PlanEditor({
 }
 
 export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspacePanelProps) {
-  const styles = useMemo(() => createStyles(theme, layout.compact), [theme, layout.compact]);
+  const [panelWidth, setPanelWidth] = useState<number | null>(null);
+  const compact = layout.compact || (panelWidth !== null && panelWidth < 800);
+  const styles = useMemo(() => createStyles(theme, compact), [theme, compact]);
   const queryClient = useQueryClient();
   const dashboardRpc = useRpc(getDashboard) as (_input: Record<string, never>) => Promise<Dashboard>;
   const saveRpc = useRpc(savePlan) as (input: SavePlanInput) => Promise<Plan>;
   const deleteRpc = useRpc(deletePlan) as (input: { planId: string }) => Promise<{ deleted: boolean }>;
   const refreshRpc = useRpc(refreshUsage) as (input: { planId?: string }) => Promise<{ usage: UsageSnapshot[] }>;
-  const applyRpc = useRpc(applyPlan) as (input: { planId: string; target: Target }) => Promise<ApplyPlanResult>;
+  const applyRpc = useRpc(applyPlan) as (input: ApplyDraft) => Promise<ApplyPlanResult>;
   const queryKey = ["coding-plan-manager", host.id, "dashboard"] as const;
   const usageKey = ["coding-plan-manager", host.id, "usage"] as const;
   const [editor, setEditor] = useState<EditorState | null>(null);
+  const [applyDraft, setApplyDraft] = useState<ApplyDraft | null>(null);
   const [notice, setNotice] = useState<NoticeState | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -915,6 +1110,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
   const applyMutation = useMutation({
     mutationFn: applyRpc,
     async onSuccess(result: ApplyPlanResult) {
+      setApplyDraft(null);
       setNotice({
         kind: result.applied ? "success" : "error",
         message: result.message,
@@ -950,10 +1146,16 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
       ...(editor.id ? { id: editor.id } : {}),
       label: editor.label,
       provider: editor.provider,
-      models: editor.models,
+      useProxy: editor.useProxy,
       ...(editor.provider === "zhipu" ? { region: editor.region } : {}),
       ...(editor.provider === "codex"
-        ? { authFilePath: editor.authFilePath, accountId: editor.accountId || undefined }
+        ? {
+            codexAuthMode: editor.codexAuthMode,
+            ...(editor.codexAuthMode === "path"
+              ? { authFilePath: editor.authFilePath }
+              : { authJsonContent: editor.authJsonContent || undefined }),
+            accountId: editor.accountId || undefined,
+          }
         : { apiKey: editor.apiKey || undefined }),
     };
     if (editor.provider !== "codex") setEditor({ ...editor, apiKey: "" });
@@ -976,15 +1178,22 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
       setConfirmDeleteId(planId);
       return;
     }
+    if (applyDraft?.planId === planId) setApplyDraft(null);
     deleteMutation.mutate({ planId });
   }
 
   const loading = dashboardQuery.isPending;
   return (
-    <View style={styles.screen}>
+    <View
+      style={styles.screen}
+      onLayout={({ nativeEvent }) => {
+        const width = Math.round(nativeEvent.layout.width);
+        setPanelWidth((current) => current === width ? current : width);
+      }}
+    >
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <View style={styles.header}>
-          <View>
+          <View style={styles.headerCopy}>
             <Text style={styles.eyebrow}>PLAN CONTROL · {host.label}</Text>
             <Text style={styles.title}>Coding Plans</Text>
             <Text style={styles.subtitle}>
@@ -1002,6 +1211,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
               label="添加 Plan"
               onPress={() => {
                 setConfirmDeleteId(null);
+                setApplyDraft(null);
                 setEditor(emptyEditor("codex", dashboard));
               }}
               styles={styles}
@@ -1098,12 +1308,30 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
                   dashboard={dashboard}
                   styles={styles}
                   applying={applying}
+                  applyDraft={applyDraft?.planId === plan.id ? applyDraft : undefined}
                   actionsDisabled={actionsBusy}
                   confirmDelete={confirmDeleteId === plan.id}
-                  onApply={(target) => applyMutation.mutate({ planId: plan.id, target })}
+                  placeholderColor={theme.colors.foregroundMuted}
+                  onRequestApply={(target) => {
+                    setEditor(null);
+                    setConfirmDeleteId(null);
+                    setApplyDraft({
+                      planId: plan.id,
+                      target,
+                      model: defaultModelFor(plan.provider, target),
+                    });
+                  }}
+                  onChangeApplyModel={(model) => {
+                    if (applyDraft?.planId === plan.id) setApplyDraft({ ...applyDraft, model });
+                  }}
+                  onConfirmApply={() => {
+                    if (applyDraft?.planId === plan.id) applyMutation.mutate(applyDraft);
+                  }}
+                  onCancelApply={() => setApplyDraft(null)}
                   onEdit={() => {
                     setConfirmDeleteId(null);
-                    setEditor(editorFor(plan));
+                    setApplyDraft(null);
+                    setEditor(editorFor(plan, dashboard));
                   }}
                   onDelete={() => requestDelete(plan.id)}
                 />

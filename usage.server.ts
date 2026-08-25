@@ -1,4 +1,11 @@
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  Agent,
+  EnvHttpProxyAgent,
+  fetch as undiciFetch,
+  type Dispatcher,
+  type Response as UndiciResponse,
+} from "undici";
 import type { Plan, UsageSnapshot, UsageWindow } from "./plans.shared";
 import {
   codexAccountId,
@@ -13,12 +20,66 @@ const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 6_000;
 const REFRESH_BUDGET_MS = 24_000;
 
+interface UsageProxyOptions {
+  httpProxy: string;
+  httpsProxy: string;
+  noProxy: string;
+}
+
+function nonEmptyEnvironmentValue(...values: Array<string | undefined>): string {
+  return values.find((value) => Boolean(value?.trim()))?.trim() ?? "";
+}
+
+function usageProxyOptions(environment: NodeJS.ProcessEnv): UsageProxyOptions {
+  return {
+    httpProxy: nonEmptyEnvironmentValue(environment.http_proxy, environment.HTTP_PROXY),
+    httpsProxy: nonEmptyEnvironmentValue(environment.https_proxy, environment.HTTPS_PROXY),
+    noProxy: nonEmptyEnvironmentValue(environment.no_proxy, environment.NO_PROXY),
+  };
+}
+
+export function usageProxyConfigured(environment: NodeJS.ProcessEnv = process.env): boolean {
+  const options = usageProxyOptions(environment);
+  return Boolean(options.httpsProxy || options.httpProxy);
+}
+
+export class UsageDispatcherPool {
+  readonly direct: Dispatcher = new Agent();
+  private proxy?: Dispatcher;
+
+  constructor(private readonly environment: NodeJS.ProcessEnv = process.env) {}
+
+  dispatcher(useProxy: boolean): Dispatcher {
+    if (!useProxy) return this.direct;
+    const options = usageProxyOptions(this.environment);
+    if (!options.httpsProxy && !options.httpProxy) {
+      throw new Error("Proxy is enabled for this Plan, but HTTPS_PROXY or HTTP_PROXY is not configured");
+    }
+    if (!this.proxy) {
+      try {
+        this.proxy = new EnvHttpProxyAgent(options);
+      } catch {
+        throw new Error("The HTTPS_PROXY or HTTP_PROXY configuration is invalid");
+      }
+    }
+    return this.proxy;
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([this.direct.close(), this.proxy?.close()]);
+  }
+}
+
+const usageDispatcherPool = new UsageDispatcherPool();
+
 class HttpError extends Error {
   constructor(
     readonly status: number,
     readonly retryAfterMs?: number,
   ) {
-    super(status === 401 || status === 403 ? "Authentication failed" : `Provider returned HTTP ${status}`);
+    super(status === 401 || status === 403
+      ? `Authentication failed (HTTP ${status})`
+      : `Provider returned HTTP ${status}`);
   }
 }
 
@@ -83,7 +144,7 @@ function durationLabel(seconds: number | undefined, fallback: string): string {
   return fallback;
 }
 
-async function readResponseJson(response: Response): Promise<unknown> {
+async function readResponseJson(response: UndiciResponse): Promise<unknown> {
   if (!response.body) throw new ProviderPayloadError("Provider returned an empty response");
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -116,6 +177,7 @@ async function fetchJson(
   headers: Record<string, string>,
   allowedHosts: readonly string[],
   deadline: number,
+  dispatcher: Dispatcher,
 ): Promise<unknown> {
   const url = new URL(urlText);
   if (
@@ -135,11 +197,12 @@ async function fetchJson(
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), Math.min(REQUEST_TIMEOUT_MS, remaining));
     try {
-      const response = await fetch(url, {
+      const response = await undiciFetch(url, {
         method: "GET",
         headers,
         redirect: "manual",
         signal: controller.signal,
+        dispatcher,
       });
       if (response.status < 200 || response.status >= 300) {
         await response.body?.cancel();
@@ -383,6 +446,8 @@ async function fetchPlanUsage(
   secret: PlanSecret,
   deadline: number,
 ): Promise<UsageSnapshot> {
+  const dispatcher = usageDispatcherPool.dispatcher(plan.useProxy);
+
   if (plan.provider === "codex") {
     if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
     const expiresAt = jwtExpiry(secret.auth);
@@ -406,6 +471,7 @@ async function fetchPlanUsage(
       },
       ["chatgpt.com"],
       deadline,
+      dispatcher,
     );
     return normalizeCodexUsage(raw, plan.id);
   }
@@ -421,6 +487,7 @@ async function fetchPlanUsage(
       },
       ["api.kimi.com"],
       deadline,
+      dispatcher,
     );
     return normalizeKimiUsage(raw, plan.id);
   }
@@ -439,6 +506,7 @@ async function fetchPlanUsage(
     },
     ["open.bigmodel.cn", "dev.bigmodel.cn", "api.z.ai"],
     deadline,
+    dispatcher,
   );
   return normalizeZhipuUsage(raw, plan.id);
 }

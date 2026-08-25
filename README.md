@@ -4,13 +4,14 @@
 
 ## 功能
 
-- 同一 provider 可保存多个 Plan；每个 Plan 有独立名称、凭据和目标模型。
+- 同一 provider 可保存多个 Plan；每个 Plan 只保存账号信息和凭据，不绑定目标模型。
 - Codex Plan 从 `auth.json` 导入，支持指定 `ChatGPT-Account-ID`。
 - 智谱和 Kimi Plan 使用 API Key；保存后 daemon 不会把明文 Key 返回给客户端。
 - 管理界面打开期间每 60 秒自动刷新，也可手动刷新。
+- 每个 Plan 可独立选择用量查询直连或使用 Paseo daemon 的网络代理。
 - 展示 Codex 主/次/附加限额、智谱新 `CREDIT_LIMIT` 与旧 `TOKENS_LIMIT` 的 5 小时/周窗口及 MCP 限额、Kimi 周额度/全部限流窗口/并发上限。
-- 一键覆盖 OpenCode 中对应 provider 当前 Plan，同时保留其他 provider 和 JSONC 注释。
-- 一键写入 Codex `auth.json` / `config.toml`，或 Claude Code `settings.json` 与 `~/.claude.json` onboarding 状态。
+- 应用 Plan 时再为目标工具选择模型，并覆盖 OpenCode 中对应 provider 当前 Plan，同时保留其他 provider 和 JSONC 注释。
+- 按本次选择的模型写入 Codex `auth.json` / `config.toml`，或 Claude Code `settings.json` 与 `~/.claude.json` onboarding 状态。
 - 检测 `opencode`、`codex`、`claude` 是否存在；插件不包含、下载或安装任何 CLI。
 
 ## Workspace 标签页
@@ -40,14 +41,19 @@ paseo plugin reload coding-plan-manager
 
 ### Codex / ChatGPT
 
-默认读取 `$CODEX_HOME/auth.json`，未设置 `CODEX_HOME` 时读取 `~/.codex/auth.json`。导入时会复制凭据到插件的私有数据目录，原文件之后被移动也不会删除 Plan。
+导入时可选择两种方式：
+
+- **从路径读取**：默认读取 `$CODEX_HOME/auth.json`，未设置 `CODEX_HOME` 时读取 `~/.codex/auth.json`。
+- **直接输入 JSON**：把完整 `auth.json` 内容粘贴到多行输入框，不要求 Paseo daemon 能访问原文件路径。
+
+两种方式都会把解析后的凭据复制到插件的私有数据目录，原始 JSON 不会进入 Plan 元数据或 dashboard。路径模式会记住来源文件以便后续同步；直接输入模式不保存来源路径，编辑时可粘贴新内容更新凭据，留空则保留现有副本。
 
 多个 Codex Plan 有两种方式：
 
 - 为不同账号准备不同 `CODEX_HOME`，添加时分别填写其 `auth.json` 路径。
 - 同一个 OAuth 身份有多个 ChatGPT workspace 时，多次导入同一个文件并填写不同 Account ID。
 
-插件每次查询和切换前会检查来源 `auth.json`；只有 JWT 中的 OAuth 用户身份明确相同且来源 generation 更新时，才会同步较新的副本。写入 OpenCode/Codex 前还会比较目标文件：同身份目标 token 更新时先吸收目标 generation，generation 冲突或身份无法判断时拒绝覆盖。不同 ChatGPT workspace 的 Account ID 不会被误当成不同登录身份。插件不会擅自兑换旋转 refresh token，因为 Codex / OpenCode 同时刷新同一个 token 可能让另一个客户端失效。若副本已过期，请先用对应账号运行 Codex 刷新，再点“编辑 / 重新导入”。
+使用路径模式时，插件每次查询和切换前会检查来源 `auth.json`；只有 JWT 中的 OAuth 用户身份明确相同且来源 generation 更新时，才会同步较新的副本。写入 OpenCode/Codex 前还会比较目标文件：同身份目标 token 更新时先吸收目标 generation，generation 冲突或身份无法判断时拒绝覆盖。不同 ChatGPT workspace 的 Account ID 不会被误当成不同登录身份。插件不会擅自兑换旋转 refresh token，因为 Codex / OpenCode 同时刷新同一个 token 可能让另一个客户端失效。若副本已过期，请先用对应账号运行 Codex 刷新，再点“编辑 / 重新导入”；直接输入模式需要在编辑表单中重新粘贴更新后的 JSON。
 
 ### 智谱 GLM
 
@@ -63,7 +69,17 @@ paseo plugin reload coding-plan-manager
 
 用量查询访问 `https://api.kimi.com/coding/v1/usages`，使用 `Bearer` API Key 和 Kimi CLI User-Agent。
 
+## 用量查询网络代理
+
+每个 Plan 的添加/编辑表单都有“用量查询代理”开关。Codex 新 Plan 以及从旧数据迁移的 Codex Plan 默认开启，智谱和 Kimi 默认关闭。
+
+开启时，插件显式使用 Paseo daemon 环境中的 `HTTPS_PROXY`，未设置时回退到 `HTTP_PROXY`，并遵守 `NO_PROXY`；关闭时强制直连。若 Plan 开启了代理但 daemon 没有配置这两个变量，界面会显示明确错误，而不是静默回退直连。
+
+这里的网络代理只负责访问供应商 HTTPS 用量接口，与 Codex/Claude Code 配置投影所说的协议转换代理不是同一种功能。
+
 ## 配置投影
+
+点击 Plan 卡片上的“配置到…”后，插件会按 provider 和目标工具预填推荐模型。可在确认写入前修改模型 ID；该值仅用于本次配置，不会保存回 Coding Plan。
 
 | Plan | OpenCode | Codex | Claude Code |
 | --- | --- | --- | --- |
@@ -125,9 +141,10 @@ secrets/<plan>.json # OAuth / API Key
 - Unix 下目录权限为 `0700`，凭据文件为 `0600`。
 - Paseo 当前没有插件级系统钥匙串 API，因此凭据和 Codex 自身的 `auth.json` 一样以本机文件保存，并非系统钥匙串加密。
 - Windows 上 Node 的 mode 不能替代完整 DACL；应确保 Paseo 数据目录只允许当前用户访问。
-- API Key 在表单中输入时存在于当前 Paseo 客户端内存，并通过现有的 Paseo RPC 连接提交一次；保存后 daemon RPC 不再返回明文凭据。日志中也不输出 token、Key、响应正文或 Authorization header。
+- API Key 或直接粘贴的 Codex `auth.json` 在表单中输入时存在于当前 Paseo 客户端内存，并通过现有的 Paseo RPC 连接提交一次；保存后 daemon RPC 不再返回明文凭据。日志中也不输出 token、Key、响应正文或 Authorization header。
 - 用量请求只允许预定义的精确 HTTPS hostname，禁用跨域 redirect，并限制响应体大小。
 - 成功快照会持久化；网络失败时界面显示旧数据和 `STALE`，不会把未知值伪装成 0。
+- 旧版 `plans.json` 会在首次读取时自动升级到 v3：移除早期 Plan 中的目标模型字段，并添加 Plan 级网络代理开关；账号、凭据、Active 状态和已写入的 CLI 配置保持不变。
 
 配置写入采用同目录临时文件、`fsync` 和 rename。涉及 auth + config 两个文件时先写 auth，第二步失败会恢复 auth 快照；这能做到崩溃恢复友好，但操作系统不支持跨两个文件的全局原子事务。切换后建议新建 CLI 会话。
 
