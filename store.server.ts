@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { readdir, unlink } from "node:fs/promises";
 import type {
+  ActiveTargets,
   Plan,
   Provider,
   SavePlanInput,
@@ -22,9 +23,9 @@ import {
 } from "./file-utils.server";
 
 interface StoreState {
-  version: 3;
+  version: 4;
   plans: Plan[];
-  activeTargets: Record<Target, string | null>;
+  activeTargets: ActiveTargets;
 }
 
 type LegacyPlanV2 = Omit<Plan, "useProxy">;
@@ -59,11 +60,15 @@ export interface PlanSnapshot {
   secret: PlanSecret;
 }
 
-const EMPTY_TARGETS: Record<Target, string | null> = {
-  opencode: null,
-  codex: null,
-  claude: null,
-};
+const PROVIDERS = ["codex", "zhipu", "kimi"] as const satisfies readonly Provider[];
+
+function emptyActiveTargets(): ActiveTargets {
+  return {
+    opencode: { codex: null, zhipu: null, kimi: null },
+    codex: null,
+    claude: null,
+  };
+}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -190,13 +195,59 @@ function validateLegacyPlanV1(value: unknown): value is LegacyPlanV1 {
   );
 }
 
-function activeTargets(value: unknown): Record<Target, string | null> {
+function referencedPlan(plans: readonly Plan[], value: unknown): Plan | undefined {
+  if (typeof value !== "string") return undefined;
+  let match: Plan | undefined;
+  for (const plan of plans) {
+    if (plan.id !== value) continue;
+    if (match) return undefined;
+    match = plan;
+  }
+  return match;
+}
+
+function migrateActiveTargets(value: unknown, plans: readonly Plan[]): ActiveTargets {
   const active = isObject(value) ? value : {};
+  const migrated = emptyActiveTargets();
+  const opencodePlan = referencedPlan(plans, active.opencode);
+  if (opencodePlan) migrated.opencode[opencodePlan.provider] = opencodePlan.id;
+  migrated.codex = referencedPlan(plans, active.codex)?.id ?? null;
+  migrated.claude = referencedPlan(plans, active.claude)?.id ?? null;
+  return migrated;
+}
+
+function parseActiveTargets(value: unknown, plans: readonly Plan[]): ActiveTargets {
+  const active = isObject(value) ? value : {};
+  const opencode = isObject(active.opencode) ? active.opencode : {};
+  const parsed = emptyActiveTargets();
+  for (const provider of PROVIDERS) {
+    const plan = referencedPlan(plans, opencode[provider]);
+    parsed.opencode[provider] = plan?.provider === provider ? plan.id : null;
+  }
+  parsed.codex = referencedPlan(plans, active.codex)?.id ?? null;
+  parsed.claude = referencedPlan(plans, active.claude)?.id ?? null;
+  return parsed;
+}
+
+function cloneActiveTargets(active: ActiveTargets): ActiveTargets {
   return {
-    opencode: typeof active.opencode === "string" ? active.opencode : null,
-    codex: typeof active.codex === "string" ? active.codex : null,
-    claude: typeof active.claude === "string" ? active.claude : null,
+    opencode: { ...active.opencode },
+    codex: active.codex,
+    claude: active.claude,
   };
+}
+
+function setActiveTarget(active: ActiveTargets, target: Target, plan: Plan): void {
+  if (target === "opencode") active.opencode[plan.provider] = plan.id;
+  else active[target] = plan.id;
+}
+
+function clearActivePlan(active: ActiveTargets, planId: string): void {
+  for (const provider of PROVIDERS) {
+    if (active.opencode[provider] === planId) active.opencode[provider] = null;
+  }
+  if (active.codex === planId) active.codex = null;
+  if (active.claude === planId) active.claude = null;
 }
 
 function addProxyDefault(plan: LegacyPlanV2): Plan {
@@ -259,17 +310,31 @@ export class PlanStore {
           } catch {
             // Never delete credentials when the metadata file cannot be trusted.
           }
-          if (parsed?.version === 3 && Array.isArray(parsed.plans) && parsed.plans.every(validatePlan)) {
+          if (parsed?.version === 4 && Array.isArray(parsed.plans) && parsed.plans.every(validatePlan)) {
             validPlanIds = new Set(parsed.plans.map((plan) => plan.id));
+          } else if (
+            parsed?.version === 3 &&
+            Array.isArray(parsed.plans) &&
+            parsed.plans.every(validatePlan)
+          ) {
+            const plans = parsed.plans.map((plan) => structuredClone(plan));
+            const migrated: StoreState = {
+              version: 4,
+              plans,
+              activeTargets: migrateActiveTargets(parsed.activeTargets, plans),
+            };
+            await atomicWriteFile(this.statePath, `${JSON.stringify(migrated, null, 2)}\n`, 0o600);
+            validPlanIds = new Set(plans.map((plan) => plan.id));
           } else if (
             parsed?.version === 2 &&
             Array.isArray(parsed.plans) &&
             parsed.plans.every(validateLegacyPlanV2)
           ) {
+            const plans = parsed.plans.map(addProxyDefault);
             const migrated: StoreState = {
-              version: 3,
-              plans: parsed.plans.map(addProxyDefault),
-              activeTargets: activeTargets(parsed.activeTargets),
+              version: 4,
+              plans,
+              activeTargets: migrateActiveTargets(parsed.activeTargets, plans),
             };
             await atomicWriteFile(this.statePath, `${JSON.stringify(migrated, null, 2)}\n`, 0o600);
             validPlanIds = new Set(migrated.plans.map((plan) => plan.id));
@@ -278,10 +343,11 @@ export class PlanStore {
             Array.isArray(parsed.plans) &&
             parsed.plans.every(validateLegacyPlanV1)
           ) {
+            const plans = parsed.plans.map(migrateLegacyPlanV1);
             const migrated: StoreState = {
-              version: 3,
-              plans: parsed.plans.map(migrateLegacyPlanV1),
-              activeTargets: activeTargets(parsed.activeTargets),
+              version: 4,
+              plans,
+              activeTargets: migrateActiveTargets(parsed.activeTargets, plans),
             };
             await atomicWriteFile(this.statePath, `${JSON.stringify(migrated, null, 2)}\n`, 0o600);
             validPlanIds = new Set(migrated.plans.map((plan) => plan.id));
@@ -321,15 +387,16 @@ export class PlanStore {
   private async readState(): Promise<StoreState> {
     await this.initialize();
     const text = await readTextIfExists(this.statePath);
-    if (!text) return { version: 3, plans: [], activeTargets: { ...EMPTY_TARGETS } };
+    if (!text) return { version: 4, plans: [], activeTargets: emptyActiveTargets() };
     const parsed = parseJsonObject(text, this.statePath);
-    if (parsed.version !== 3 || !Array.isArray(parsed.plans) || !parsed.plans.every(validatePlan)) {
+    if (parsed.version !== 4 || !Array.isArray(parsed.plans) || !parsed.plans.every(validatePlan)) {
       throw new Error(`Unsupported or corrupt plan store: ${this.statePath}`);
     }
+    const plans = parsed.plans.map((plan) => structuredClone(plan));
     return {
-      version: 3,
-      plans: parsed.plans,
-      activeTargets: activeTargets(parsed.activeTargets),
+      version: 4,
+      plans,
+      activeTargets: parseActiveTargets(parsed.activeTargets, plans),
     };
   }
 
@@ -348,15 +415,16 @@ export class PlanStore {
     return plan;
   }
 
-  async getActiveTargets(): Promise<Record<Target, string | null>> {
-    return { ...(await this.readState()).activeTargets };
+  async getActiveTargets(): Promise<ActiveTargets> {
+    return cloneActiveTargets((await this.readState()).activeTargets);
   }
 
   async markActive(target: Target, planId: string): Promise<void> {
     await this.exclusive(async () => {
       const state = await this.readState();
-      if (!state.plans.some((plan) => plan.id === planId)) throw new Error("Coding Plan not found");
-      state.activeTargets[target] = planId;
+      const plan = referencedPlan(state.plans, planId);
+      if (!plan) throw new Error("Coding Plan not found");
+      setActiveTarget(state.activeTargets, target, plan);
       await this.writeState(state);
     });
   }
@@ -450,7 +518,7 @@ export class PlanStore {
         );
       }
       if (outcome.applied) {
-        state.activeTargets[target] = plan.id;
+        setActiveTarget(state.activeTargets, target, plan);
         await this.writeState(state);
       }
       return outcome.result;
@@ -582,11 +650,7 @@ export class PlanStore {
       const index = state.plans.findIndex((candidate) => candidate.id === id);
       if (index >= 0) state.plans[index] = plan;
       else state.plans.push(plan);
-      if (existing) {
-        for (const target of ["opencode", "codex", "claude"] as const) {
-          if (state.activeTargets[target] === id) state.activeTargets[target] = null;
-        }
-      }
+      if (existing) clearActivePlan(state.activeTargets, id);
       try {
         if (existing) {
           const usage = (await this.readUsageCache()).filter((snapshot) => snapshot.planId !== id);
@@ -614,9 +678,7 @@ export class PlanStore {
       const nextPlans = state.plans.filter((plan) => plan.id !== planId);
       const existed = nextPlans.length !== state.plans.length;
       state.plans = nextPlans;
-      for (const target of ["opencode", "codex", "claude"] as const) {
-        if (state.activeTargets[target] === planId) state.activeTargets[target] = null;
-      }
+      clearActivePlan(state.activeTargets, planId);
       await this.writeState(state);
       await unlink(this.secretPath(planId)).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;

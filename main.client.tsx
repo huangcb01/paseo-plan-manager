@@ -133,6 +133,16 @@ function isTargetSupported(plan: Plan, target: Target): boolean {
   return plan.provider === "codex" || (plan.provider === "zhipu" && plan.region !== "cn-dev");
 }
 
+function unsupportedTargetReason(plan: Plan, target: Target): string {
+  if (target === "claude" && plan.provider === "codex") {
+    return "无法接入 Claude Code：ChatGPT Codex OAuth 与 Anthropic 协议不兼容，需要 Anthropic-to-Responses 协议转换代理；本插件未内置该代理。";
+  }
+  if (target === "codex") {
+    return `无法接入 Codex：${PROVIDER_LABELS[plan.provider]} Plan 仅提供 Chat Completions，而 Codex 要求 Responses API，需要协议转换代理；本插件未内置该代理。`;
+  }
+  return `无法将 ${PROVIDER_LABELS[plan.provider]} Plan 接入 ${TARGET_LABELS[target]}。`;
+}
+
 function resetLabel(value: string | undefined): string {
   if (!value) return "重置时间未知";
   const milliseconds = Date.parse(value);
@@ -182,9 +192,9 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       gap: 18,
     },
     header: {
-      flexDirection: compact ? "column" : "row",
-      flexWrap: "wrap",
-      alignItems: compact ? "stretch" : "flex-end",
+      flexDirection: "row",
+      flexWrap: "nowrap",
+      alignItems: "flex-start",
       justifyContent: "space-between",
       gap: 14,
       paddingBottom: 18,
@@ -194,7 +204,7 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     headerCopy: {
       flexGrow: 1,
       flexShrink: 1,
-      minWidth: compact ? 0 : 320,
+      minWidth: 0,
     },
     eyebrow: {
       color: theme.colors.accent,
@@ -221,6 +231,8 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       alignItems: "center",
       flexWrap: "wrap",
       flexShrink: 0,
+      justifyContent: "flex-end",
+      alignSelf: "flex-start",
       maxWidth: "100%",
       gap: 8,
     },
@@ -424,9 +436,6 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     targetBadgeActive: {
       borderColor: theme.colors.accent,
     },
-    targetBadgeDisabled: {
-      opacity: 0.45,
-    },
     targetBadgeText: {
       color: theme.colors.foregroundMuted,
       fontSize: 9,
@@ -486,6 +495,14 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       borderColor: theme.colors.accent,
       padding: compact ? 14 : 18,
       gap: 15,
+    },
+    editorCard: {
+      minWidth: 250,
+      maxWidth: 620,
+      flexBasis: 250,
+      flexGrow: 1,
+      flexShrink: 1,
+      alignSelf: "flex-start",
     },
     applyConfigurator: {
       borderTopWidth: 1,
@@ -601,6 +618,10 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       padding: 12,
       gap: 12,
     },
+    proxyControlCard: {
+      flexDirection: "column",
+      alignItems: "stretch",
+    },
     proxyCopy: {
       flex: 1,
       minWidth: 0,
@@ -616,6 +637,9 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       alignItems: "center",
       alignSelf: compact ? "flex-start" : "center",
       gap: 8,
+    },
+    proxyToggleCard: {
+      alignSelf: "flex-start",
     },
     proxyTrack: {
       width: 42,
@@ -671,6 +695,10 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       flexDirection: compact ? "column" : "row",
       flexWrap: compact ? "nowrap" : "wrap",
       gap: 11,
+    },
+    fieldsCard: {
+      flexDirection: "column",
+      flexWrap: "nowrap",
     },
     field: {
       minWidth: compact ? 0 : 260,
@@ -959,8 +987,11 @@ function PlanCard({
   onDelete: () => void;
 }) {
   const activeTargets = (["opencode", "codex", "claude"] as const).filter(
-    (target) => dashboard.activeTargets[target] === plan.id,
+    (target) => target === "opencode"
+      ? dashboard.activeTargets.opencode[plan.provider] === plan.id
+      : dashboard.activeTargets[target] === plan.id,
   );
+  const [targetError, setTargetError] = useState<string | null>(null);
   const modelCandidates = applyDraft
     ? [...new Set([...modelCandidatesFor(plan.provider, applyDraft.target), ...applyDraft.models])]
     : [];
@@ -1014,25 +1045,42 @@ function PlanCard({
             <Pressable
               key={target}
               accessibilityRole="button"
-              accessibilityState={{ selected: active, disabled: actionsDisabled || !supported }}
-              disabled={actionsDisabled || !supported}
-              onPress={() => onRequestApply(target)}
+              accessibilityState={{ selected: active, disabled: actionsDisabled }}
+              disabled={actionsDisabled}
+              onPress={() => {
+                if (!supported) {
+                  setTargetError(unsupportedTargetReason(plan, target));
+                  return;
+                }
+                setTargetError(null);
+                onRequestApply(target);
+              }}
               style={({ pressed }) => [
                 styles.targetBadge,
                 active && styles.targetBadgeActive,
-                !supported && styles.targetBadgeDisabled,
-                pressed && supported && styles.buttonPressed,
+                pressed && styles.buttonPressed,
               ]}
             >
               <Text style={[styles.targetBadgeText, active && styles.targetBadgeTextActive]}>
                 {applying === target
                   ? "接入中..."
-                  : `${active ? "ACTIVE · " : ""}${TARGET_LABELS[target]}${supported ? "" : "（需代理）"}`}
+                  : TARGET_LABELS[target]}
               </Text>
             </Pressable>
           );
         })}
       </View>
+      {targetError ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${targetError} 点击关闭提示`}
+          onPress={() => setTargetError(null)}
+          style={[styles.notice, styles.noticeError]}
+        >
+          <Text style={styles.noticeText}>{targetError}</Text>
+          <Text style={styles.noticeDetail}>点击关闭</Text>
+        </Pressable>
+      ) : null}
 
       {usage?.windows.length ? (
         <View style={styles.quotaList}>
@@ -1184,6 +1232,7 @@ function PlanEditor({
   placeholderColor,
   onSave,
   onCancel,
+  embedded = false,
 }: {
   editor: EditorState;
   setEditor: (next: EditorState) => void;
@@ -1192,13 +1241,14 @@ function PlanEditor({
   placeholderColor: string;
   onSave: () => void;
   onCancel: () => void;
+  embedded?: boolean;
 }) {
   function selectProvider(provider: Provider) {
     if (editor.id) return;
     setEditor({ ...emptyEditor(provider), label: editor.label });
   }
   return (
-    <View style={styles.editor}>
+    <View style={[styles.editor, embedded && styles.editorCard]}>
       <View style={styles.sectionHeader}>
         <View>
           <Text style={styles.eyebrow}>{editor.id ? "EDIT PLAN" : "NEW PLAN"}</Text>
@@ -1232,7 +1282,7 @@ function PlanEditor({
         })}
       </View>
 
-      <View style={styles.proxyControl}>
+      <View style={[styles.proxyControl, embedded && styles.proxyControlCard]}>
         <View style={styles.proxyCopy}>
           <Text style={styles.proxyTitle}>用量查询代理</Text>
           <Text style={styles.muted}>
@@ -1247,6 +1297,7 @@ function PlanEditor({
           onPress={() => setEditor({ ...editor, useProxy: !editor.useProxy })}
           style={({ pressed }) => [
             styles.proxyToggle,
+            embedded && styles.proxyToggleCard,
             saving && styles.buttonDisabled,
             pressed && styles.buttonPressed,
           ]}
@@ -1258,7 +1309,7 @@ function PlanEditor({
         </Pressable>
       </View>
 
-      <View style={styles.fields}>
+      <View style={[styles.fields, embedded && styles.fieldsCard]}>
         <Field
           label="显示名称"
           value={editor.label}
@@ -1266,11 +1317,12 @@ function PlanEditor({
           placeholder="例如：工作账号 Pro"
           styles={styles}
           placeholderColor={placeholderColor}
+          constrained={embedded}
           disabled={saving}
         />
         {editor.provider === "codex" ? (
           <>
-            <View style={[styles.field, styles.fieldWide]}>
+            <View style={[styles.field, styles.fieldWide, embedded && styles.fieldConstrained]}>
               <Text style={styles.fieldLabel}>auth.json 导入方式</Text>
               <View style={styles.providerPicker}>
                 {([
@@ -1313,6 +1365,7 @@ function PlanEditor({
                 styles={styles}
                 placeholderColor={placeholderColor}
                 wide
+                constrained={embedded}
                 disabled={saving}
               />
             ) : (
@@ -1325,6 +1378,7 @@ function PlanEditor({
                 placeholderColor={placeholderColor}
                 wide
                 multiline
+                constrained={embedded}
                 disabled={saving}
               />
             )}
@@ -1335,6 +1389,7 @@ function PlanEditor({
               placeholder="留空则从 token 读取"
               styles={styles}
               placeholderColor={placeholderColor}
+              constrained={embedded}
               disabled={saving}
             />
           </>
@@ -1348,13 +1403,14 @@ function PlanEditor({
             placeholderColor={placeholderColor}
             secure
             wide
+            constrained={embedded}
             disabled={saving}
           />
         )}
       </View>
 
       {editor.provider === "zhipu" ? (
-        <View style={styles.field}>
+        <View style={[styles.field, embedded && styles.fieldConstrained]}>
           <Text style={styles.fieldLabel}>区域</Text>
           <View style={styles.providerPicker}>
             {([
@@ -1482,7 +1538,11 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
     ? Object.values(dashboard.tools).filter((tool) => tool.installed).length
     : 0;
   const activeCount = dashboard
-    ? new Set(Object.values(dashboard.activeTargets).filter(Boolean)).size
+    ? new Set([
+        ...Object.values(dashboard.activeTargets.opencode),
+        dashboard.activeTargets.codex,
+        dashboard.activeTargets.claude,
+      ].filter((planId): planId is string => typeof planId === "string")).size
     : 0;
   const actionsBusy = saving || deleteMutation.isPending || applyMutation.isPending;
 
@@ -1604,7 +1664,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
           </View>
         ) : null}
 
-        {editor ? (
+        {editor && !editor.id ? (
           <PlanEditor
             editor={editor}
             setEditor={setEditor}
@@ -1640,6 +1700,21 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
         ) : dashboard?.plans.length ? (
           <View style={styles.cards}>
             {dashboard.plans.map((plan) => {
+              if (editor?.id === plan.id) {
+                return (
+                  <PlanEditor
+                    key={plan.id}
+                    editor={editor}
+                    setEditor={setEditor}
+                    saving={saving}
+                    styles={styles}
+                    placeholderColor={theme.colors.foregroundMuted}
+                    onSave={submitEditor}
+                    onCancel={() => setEditor(null)}
+                    embedded
+                  />
+                );
+              }
               const applying = applyMutation.isPending && applyMutation.variables?.planId === plan.id
                 ? applyMutation.variables.target
                 : undefined;

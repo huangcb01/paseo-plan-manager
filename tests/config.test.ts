@@ -700,10 +700,14 @@ test("migrates v1 plans without retaining target models", async () => {
 
     assert.equal(plans.length, 1);
     assert.equal("models" in plans[0], false);
-    assert.equal(state.version, 3);
+    assert.equal(state.version, 4);
     assert.equal("models" in state.plans[0], false);
     assert.equal(plans[0].useProxy, false);
-    assert.equal((await store.getActiveTargets()).opencode, currentPlan.id);
+    assert.deepEqual((await store.getActiveTargets()).opencode, {
+      codex: null,
+      zhipu: null,
+      kimi: currentPlan.id,
+    });
     assert.deepEqual(await store.readSecret(currentPlan.id), {
       kind: "api-key",
       apiKey: "preserved-secret",
@@ -732,10 +736,14 @@ test("migrates v2 plans with provider-specific proxy defaults", async () => {
     const plans = await store.listPlans();
     const state = JSON.parse(await readFile(path.join(root, "plans.json"), "utf8"));
 
-    assert.equal(state.version, 3);
+    assert.equal(state.version, 4);
     assert.equal(plans.find((item) => item.provider === "codex")?.useProxy, true);
     assert.equal(plans.find((item) => item.provider === "zhipu")?.useProxy, false);
-    assert.equal((await store.getActiveTargets()).opencode, "codex-1");
+    assert.deepEqual((await store.getActiveTargets()).opencode, {
+      codex: "codex-1",
+      zhipu: null,
+      kimi: null,
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

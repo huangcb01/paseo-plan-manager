@@ -97,6 +97,8 @@ paseo plugin reload coding-plan-manager
 
 智谱和 Kimi 会把本次所选模型全部写入 `provider.zhipu.models` 或 `provider.kimi.models`，并以首个模型更新顶层 `model`；Codex OAuth 只更新顶层默认模型，不改 OpenCode 内置 OpenAI 模型目录。插件还会更新对应 auth 条目，其他 provider、插件、MCP、skills 及 JSONC 注释会保留。若设置了 `OPENCODE_CONFIG_CONTENT` 或 `OPENCODE_AUTH_CONTENT`，文件修改不会生效，因此插件会拒绝操作。
 
+OpenCode 的 Active 状态按 provider 分槽保存：Codex、智谱和 Kimi 各自最多保留一个 Plan，因此三个 provider 的凭据和目录状态可以同时共存；再次应用同一 provider 的 Plan 只替换该 provider 的记录。不过 OpenCode 顶层 `model` 始终只有一个，最近一次成功应用的 Plan 首个模型是当前默认。Codex 和 Claude Code 的 Active 状态仍各自是单例，后一次成功应用会替换该目标先前的 Plan。
+
 ### Codex
 
 路径为 `$CODEX_HOME` 或 `~/.codex` 下的 `auth.json` 和 `config.toml`。首个所选模型写入根级默认。插件用结构化 TOML parser 在写入前后校验文件，保留其他 TOML 表，只更新根级模型选择和带有以下标记的 provider 块；无法安全修改的 quoted/特殊布局会拒绝写入，而不是生成重复键：
@@ -144,7 +146,7 @@ secrets/<plan>.json # OAuth / API Key
 - API Key 或直接粘贴的 Codex `auth.json` 在表单中输入时存在于当前 Paseo 客户端内存，并通过现有的 Paseo RPC 连接提交一次；保存后 daemon RPC 不再返回明文凭据。日志中也不输出 token、Key、响应正文或 Authorization header。
 - 用量请求只允许预定义的精确 HTTPS hostname，禁用跨域 redirect，并限制响应体大小。
 - 成功快照会持久化；网络失败时界面显示旧数据和 `STALE`，不会把未知值伪装成 0。
-- 旧版 `plans.json` 会在首次读取时自动升级到 v3：移除早期 Plan 中的目标模型字段，并添加 Plan 级网络代理开关；账号、凭据、Active 状态和已写入的 CLI 配置保持不变。
+- `plans.json` 当前版本为 v4。有效的 v1/v2/v3 数据会在首次读取时直接升级到 v4：移除早期 Plan 中的目标模型字段，补充 Plan 级网络代理开关，并把 Active 状态校验到现有 Plan。v3 只记录了一个 OpenCode Plan，因此迁移只能依据该 Plan 元数据中的精确 provider 恢复对应的一个 provider 槽，无法恢复当时未记录的其他 OpenCode provider；不会根据 Plan ID 猜测 provider。Codex 和 Claude Code 仍分别迁移其单例引用。
 
 配置写入采用同目录临时文件、`fsync` 和 rename。涉及 auth + config 两个文件时先写 auth，第二步失败会恢复 auth 快照；这能做到崩溃恢复友好，但操作系统不支持跨两个文件的全局原子事务。切换后建议新建 CLI 会话。
 

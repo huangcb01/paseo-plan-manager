@@ -6,6 +6,16 @@ export const TargetSchema = z.enum(["opencode", "codex", "claude"]);
 export const ZhipuRegionSchema = z.enum(["cn", "global", "cn-dev"]);
 export const CodexAuthModeSchema = z.enum(["path", "content"]);
 
+export const ActiveTargetsSchema = z.object({
+  opencode: z.object({
+    codex: z.string().nullable(),
+    zhipu: z.string().nullable(),
+    kimi: z.string().nullable(),
+  }),
+  codex: z.string().nullable(),
+  claude: z.string().nullable(),
+});
+
 export const PlanSchema = z.object({
   id: z.string(),
   label: z.string(),
@@ -61,11 +71,7 @@ const ToolStatusSchema = z.object({
 export const DashboardSchema = z.object({
   plans: z.array(PlanSchema),
   usage: z.array(UsageSnapshotSchema),
-  activeTargets: z.object({
-    opencode: z.string().nullable(),
-    codex: z.string().nullable(),
-    claude: z.string().nullable(),
-  }),
+  activeTargets: ActiveTargetsSchema,
   tools: z.object({
     opencode: ToolStatusSchema,
     codex: ToolStatusSchema,
@@ -135,6 +141,7 @@ export type Provider = z.infer<typeof ProviderSchema>;
 export type Target = z.infer<typeof TargetSchema>;
 export type ZhipuRegion = z.infer<typeof ZhipuRegionSchema>;
 export type CodexAuthMode = z.infer<typeof CodexAuthModeSchema>;
+export type ActiveTargets = z.infer<typeof ActiveTargetsSchema>;
 export type Plan = z.infer<typeof PlanSchema>;
 export type SavePlanInput = z.infer<typeof SavePlanInputSchema>;
 export type ApplyPlanInput = z.infer<typeof ApplyPlanInputSchema>;
