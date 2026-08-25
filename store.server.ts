@@ -261,13 +261,132 @@ function migrateLegacyPlanV1(plan: LegacyPlanV1): Plan {
 }
 
 function validateUsage(value: unknown): value is UsageSnapshot {
+  if (
+    !isObject(value) ||
+    typeof value.planId !== "string" ||
+    (value.status !== "ok" && value.status !== "error") ||
+    typeof value.stale !== "boolean" ||
+    typeof value.fetchedAt !== "string" ||
+    !Array.isArray(value.windows) ||
+    !value.windows.every((window) => (
+      isObject(window) &&
+      typeof window.id === "string" &&
+      typeof window.label === "string"
+    ))
+  ) {
+    return false;
+  }
+  if (value.tokenActivity !== undefined) {
+    if (
+      !isObject(value.tokenActivity) ||
+      value.tokenActivity.source !== "provider" ||
+      value.tokenActivity.granularity !== "day" ||
+      !Array.isArray(value.tokenActivity.points) ||
+      !value.tokenActivity.points.every((point) => (
+        isObject(point) &&
+        typeof point.date === "string" &&
+        typeof point.tokens === "number" &&
+        Number.isFinite(point.tokens) &&
+        point.tokens >= 0 &&
+        (point.calls === undefined || (
+          typeof point.calls === "number" && Number.isInteger(point.calls) && point.calls >= 0
+        ))
+      ))
+    ) {
+      return false;
+    }
+  }
+  if (value.quotaHistory !== undefined) {
+    if (
+      !isObject(value.quotaHistory) ||
+      value.quotaHistory.source !== "local" ||
+      typeof value.quotaHistory.intervalSeconds !== "number" ||
+      !Number.isInteger(value.quotaHistory.intervalSeconds) ||
+      value.quotaHistory.intervalSeconds <= 0 ||
+      !Array.isArray(value.quotaHistory.points) ||
+      !value.quotaHistory.points.every((point) => (
+        isObject(point) &&
+        typeof point.sampledAt === "string" &&
+        Array.isArray(point.windows) &&
+        point.windows.every((window) => (
+          isObject(window) &&
+          typeof window.id === "string" &&
+          typeof window.label === "string" &&
+          typeof window.usedPercent === "number" &&
+          Number.isFinite(window.usedPercent) &&
+          window.usedPercent >= 0 &&
+          window.usedPercent <= 100 &&
+          (window.reset === undefined || typeof window.reset === "boolean")
+        ))
+      ))
+    ) {
+      return false;
+    }
+  }
   return (
-    isObject(value) &&
-    typeof value.planId === "string" &&
-    (value.status === "ok" || value.status === "error") &&
-    typeof value.fetchedAt === "string" &&
-    Array.isArray(value.windows)
+    (value.tokenActivityStale === undefined || typeof value.tokenActivityStale === "boolean") &&
+    (value.tokenActivityError === undefined || typeof value.tokenActivityError === "string") &&
+    (value.error === undefined || typeof value.error === "string")
   );
+}
+
+function mergeCachedUsage(current: UsageSnapshot | undefined, incoming: UsageSnapshot): UsageSnapshot {
+  if (!current) return incoming;
+  const currentTime = Date.parse(current.fetchedAt);
+  const incomingTime = Date.parse(incoming.fetchedAt);
+  const incomingIsOlder = Number.isFinite(currentTime) &&
+    Number.isFinite(incomingTime) &&
+    incomingTime < currentTime;
+  let merged = incomingIsOlder ? current : incoming;
+  if (!incomingIsOlder && incoming.tokenActivityStale && current.tokenActivity) {
+    merged = {
+      ...merged,
+      tokenActivity: current.tokenActivity,
+      tokenActivityStale: true,
+    };
+  }
+  if (current.quotaHistory && incoming.quotaHistory) {
+    const points = new Map(current.quotaHistory.points.map((point) => [point.sampledAt, point]));
+    for (const point of incoming.quotaHistory.points) points.set(point.sampledAt, point);
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const intervalMs = incoming.quotaHistory.intervalSeconds * 1000;
+    const sorted = [...points.values()]
+      .filter((point) => {
+        const timestamp = Date.parse(point.sampledAt);
+        return Number.isFinite(timestamp) && timestamp >= cutoff;
+      })
+      .sort((left, right) => left.sampledAt.localeCompare(right.sampledAt));
+    const sampled: typeof sorted = [];
+    for (const point of sorted) {
+      const last = sampled[sampled.length - 1];
+      if (!last || Date.parse(point.sampledAt) - Date.parse(last.sampledAt) >= intervalMs) {
+        sampled.push(point);
+      }
+    }
+    const maxPoints = Math.ceil(
+      (7 * 24 * 60 * 60) / incoming.quotaHistory.intervalSeconds,
+    ) + 1;
+    merged = {
+      ...merged,
+      quotaHistory: {
+        ...incoming.quotaHistory,
+        points: sampled.slice(-maxPoints),
+      },
+    };
+  } else if (current.quotaHistory && !incoming.quotaHistory) {
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const points = current.quotaHistory.points.filter((point) => {
+      const timestamp = Date.parse(point.sampledAt);
+      return Number.isFinite(timestamp) && timestamp >= cutoff;
+    });
+    if (points.length) {
+      merged = { ...merged, quotaHistory: { ...current.quotaHistory, points } };
+    } else if (merged.quotaHistory) {
+      const { quotaHistory: _expired, ...withoutQuotaHistory } = merged;
+      merged = withoutQuotaHistory;
+    }
+  }
+  return merged;
 }
 
 export class PlanStore {
@@ -545,6 +664,14 @@ export class PlanStore {
         ? state.plans.find((candidate) => candidate.id === input.id)
         : undefined;
       if (input.id && !existing) throw new Error("Coding Plan not found");
+      let storedSecret: PlanSecret | undefined;
+      if (existing) {
+        try {
+          storedSecret = await this.readSecretFile(existing.id);
+        } catch {
+          // A replacement credential below can repair a missing or corrupt secret.
+        }
+      }
 
       const id = existing?.id ?? `${input.provider}-${randomUUID()}`;
       let secret: PlanSecret;
@@ -555,8 +682,8 @@ export class PlanStore {
       if (input.provider === "codex") {
         let current: CodexSecret | undefined;
         if (existing?.provider === "codex") {
-          const stored = await this.readSecretFile(existing.id);
-          if (stored.kind !== "codex-auth") throw new Error("Codex credential is missing");
+          const stored = storedSecret;
+          if (!stored || stored.kind !== "codex-auth") throw new Error("Codex credential is missing");
           current = await this.newerCodexSource(existing, stored);
         }
 
@@ -617,8 +744,8 @@ export class PlanStore {
         if (providedKey) {
           secret = { kind: "api-key", apiKey: providedKey };
         } else if (existing?.provider === input.provider) {
-          const current = await this.readSecretFile(existing.id);
-          if (current.kind !== "api-key") throw new Error("Enter an API key for this plan");
+          const current = storedSecret;
+          if (!current || current.kind !== "api-key") throw new Error("Enter an API key for this plan");
           secret = current;
         } else {
           throw new Error("Enter an API key for this plan");
@@ -646,24 +773,41 @@ export class PlanStore {
 
       const secretPath = this.secretPath(id);
       const previousSecret = await captureFile(secretPath);
+      const clearUsage = Boolean(existing && (
+        existing.provider !== plan.provider ||
+        existing.region !== plan.region ||
+        !storedSecret ||
+        serializeSecret(storedSecret) !== serializeSecret(secret)
+      ));
+      const previousUsage = clearUsage ? await this.readUsageCache() : undefined;
       await atomicWriteFile(secretPath, serializeSecret(secret), 0o600);
       const index = state.plans.findIndex((candidate) => candidate.id === id);
       if (index >= 0) state.plans[index] = plan;
       else state.plans.push(plan);
       if (existing) clearActivePlan(state.activeTargets, id);
       try {
-        if (existing) {
-          const usage = (await this.readUsageCache()).filter((snapshot) => snapshot.planId !== id);
-          await this.writeUsageCache(usage);
+        if (previousUsage) {
+          await this.writeUsageCache(previousUsage.filter((snapshot) => snapshot.planId !== id));
         }
         await this.writeState(state);
       } catch (error) {
+        const rollbackErrors: unknown[] = [];
         try {
           await restoreFile(secretPath, previousSecret);
         } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+        if (previousUsage) {
+          try {
+            await this.writeUsageCache(previousUsage);
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+        }
+        if (rollbackErrors.length) {
           throw new AggregateError(
-            [error, rollbackError],
-            "Failed to save Coding Plan metadata and restore its credential",
+            [error, ...rollbackErrors],
+            "Failed to save Coding Plan metadata and restore cached data",
           );
         }
         throw error;
@@ -718,7 +862,9 @@ export class PlanStore {
       );
       const merged = new Map((await this.readUsageCache()).map((snapshot) => [snapshot.planId, snapshot]));
       for (const snapshot of usage) {
-        if (validPlans.has(snapshot.planId)) merged.set(snapshot.planId, snapshot);
+        if (validPlans.has(snapshot.planId)) {
+          merged.set(snapshot.planId, mergeCachedUsage(merged.get(snapshot.planId), snapshot));
+        }
       }
       const currentPlanIds = new Set(state.plans.map((plan) => plan.id));
       await this.writeUsageCache(

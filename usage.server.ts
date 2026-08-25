@@ -6,7 +6,14 @@ import {
   type Dispatcher,
   type Response as UndiciResponse,
 } from "undici";
-import type { Plan, UsageSnapshot, UsageWindow } from "./plans.shared";
+import type {
+  Plan,
+  QuotaSampleWindow,
+  TokenActivity,
+  TokenActivityPoint,
+  UsageSnapshot,
+  UsageWindow,
+} from "./plans.shared";
 import {
   codexAccountId,
   codexTokens,
@@ -18,7 +25,13 @@ import {
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 6_000;
+const HISTORY_REQUEST_BUDGET_MS = 8_000;
 const REFRESH_BUDGET_MS = 24_000;
+export const LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS = 5 * 60;
+const LOCAL_QUOTA_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCAL_QUOTA_HISTORY_MAX_POINTS = Math.ceil(
+  LOCAL_QUOTA_HISTORY_RETENTION_MS / (LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS * 1000),
+) + 1;
 
 interface UsageProxyOptions {
   httpProxy: string;
@@ -111,6 +124,45 @@ function numberValue(value: unknown): number | undefined {
   return undefined;
 }
 
+function dateKey(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const calendar = value.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (calendar) return calendar[1];
+  }
+  const numeric = numberValue(value);
+  const milliseconds = numeric === undefined
+    ? typeof value === "string" ? Date.parse(value) : NaN
+    : numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  if (!Number.isFinite(milliseconds)) return undefined;
+  return new Date(milliseconds).toISOString().slice(0, 10);
+}
+
+function tokenActivity(points: Map<string, { tokens: number; calls: number; hasCalls: boolean }>): TokenActivity {
+  const normalized: TokenActivityPoint[] = [...points.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([date, point]) => ({
+      date,
+      tokens: point.tokens,
+      ...(point.hasCalls ? { calls: point.calls } : {}),
+    }));
+  return { source: "provider", granularity: "day", points: normalized };
+}
+
+function addTokenActivityPoint(
+  points: Map<string, { tokens: number; calls: number; hasCalls: boolean }>,
+  date: string,
+  tokens: number,
+  calls: number | undefined,
+): void {
+  const current = points.get(date) ?? { tokens: 0, calls: 0, hasCalls: false };
+  current.tokens += Math.max(0, tokens);
+  if (calls !== undefined) {
+    current.calls += Math.max(0, Math.trunc(calls));
+    current.hasCalls = true;
+  }
+  points.set(date, current);
+}
+
 function clampPercent(value: number | undefined): number | undefined {
   return value === undefined ? undefined : Math.max(0, Math.min(100, value));
 }
@@ -178,6 +230,7 @@ async function fetchJson(
   allowedHosts: readonly string[],
   deadline: number,
   dispatcher: Dispatcher,
+  options: { attempts?: number; timeoutMs?: number } = {},
 ): Promise<unknown> {
   const url = new URL(urlText);
   if (
@@ -191,11 +244,12 @@ async function fetchJson(
   }
 
   let lastError: unknown;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const attempts = Math.max(1, options.attempts ?? 2);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error("Usage refresh deadline exceeded");
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.min(REQUEST_TIMEOUT_MS, remaining));
+    const timeout = setTimeout(() => controller.abort(), Math.min(options.timeoutMs ?? REQUEST_TIMEOUT_MS, remaining));
     try {
       const response = await undiciFetch(url, {
         method: "GET",
@@ -218,7 +272,7 @@ async function fetchJson(
       const status = error instanceof HttpError ? error.status : undefined;
       const retryable = !(error instanceof ProviderPayloadError) &&
         (status === 429 || (status !== undefined && status >= 500) || status === undefined);
-      if (!retryable || attempt === 1 || Date.now() >= deadline) break;
+      if (!retryable || attempt === attempts - 1 || Date.now() >= deadline) break;
       const wait = error instanceof HttpError && error.retryAfterMs !== undefined
         ? Math.min(error.retryAfterMs, 10_000)
         : 400 * 2 ** attempt + Math.floor(Math.random() * 200);
@@ -313,6 +367,96 @@ export function normalizeCodexUsage(raw: unknown, planId: string): UsageSnapshot
   };
 }
 
+export function normalizeCodexTokenActivity(raw: unknown): TokenActivity {
+  if (!isObject(raw)) {
+    throw new Error("Codex token activity response has an unexpected shape");
+  }
+  const metadata = isObject(raw.metadata) ? raw.metadata : undefined;
+  const statsError = metadata
+    ? stringValue(valueAt(metadata, "stats_error", "statsError"))
+    : undefined;
+  if (statsError) throw new Error(`Codex token activity is unavailable: ${statsError}`);
+  const stats = isObject(raw.stats) ? raw.stats : raw;
+  let buckets = stats.daily_usage_buckets !== undefined
+    ? stats.daily_usage_buckets
+    : stats.dailyUsageBuckets;
+  if (buckets === undefined && stats !== raw) {
+    buckets = raw.daily_usage_buckets !== undefined
+      ? raw.daily_usage_buckets
+      : raw.dailyUsageBuckets;
+  }
+  if (buckets === null) {
+    return tokenActivity(new Map());
+  }
+  if (buckets === undefined) {
+    throw new Error("Codex token activity response omitted daily buckets");
+  }
+  if (!Array.isArray(buckets)) {
+    throw new Error("Codex token activity response does not contain daily buckets");
+  }
+  const points = new Map<string, { tokens: number; calls: number; hasCalls: boolean }>();
+  for (const bucket of buckets) {
+    if (!isObject(bucket)) continue;
+    const date = dateKey(valueAt(bucket, "start_date", "startDate"));
+    const tokens = numberValue(bucket.tokens);
+    if (!date || tokens === undefined || tokens < 0) continue;
+    addTokenActivityPoint(points, date, tokens, undefined);
+  }
+  return tokenActivity(points);
+}
+
+function summedModelSeries(models: unknown, ...keys: string[]): number[] | undefined {
+  if (!Array.isArray(models)) return undefined;
+  const totals: number[] = [];
+  let found = false;
+  for (const model of models) {
+    if (!isObject(model)) continue;
+    const rawSeries = valueAt(model, ...keys);
+    if (!Array.isArray(rawSeries)) continue;
+    rawSeries.forEach((value, index) => {
+      const numeric = numberValue(value);
+      if (numeric === undefined) return;
+      totals[index] = (totals[index] ?? 0) + numeric;
+      found = true;
+    });
+  }
+  return found ? totals : undefined;
+}
+
+export function normalizeZhipuTokenActivity(raw: unknown): TokenActivity {
+  if (!isObject(raw)) throw new Error("GLM token activity response has an unexpected shape");
+  if (raw.success === false || (numberValue(raw.code) ?? 200) >= 400) {
+    throw new Error("GLM token activity API rejected the request");
+  }
+  const data = isObject(raw.data) ? raw.data : raw;
+  const times = valueAt(data, "x_time", "xTime");
+  if (!Array.isArray(times)) {
+    throw new Error("GLM token activity response does not contain time buckets");
+  }
+  const models = valueAt(data, "modelDataList", "model_data_list");
+  const rawTokens = valueAt(data, "tokensUsage", "tokens_usage");
+  const tokens = Array.isArray(rawTokens)
+    ? rawTokens
+    : summedModelSeries(models, "tokensUsage", "tokens_usage");
+  if (!tokens) {
+    if (times.length === 0) return tokenActivity(new Map());
+    throw new Error("GLM token activity response does not contain token buckets");
+  }
+  const rawCalls = valueAt(data, "modelCallCount", "model_call_count");
+  const calls = Array.isArray(rawCalls)
+    ? rawCalls
+    : summedModelSeries(models, "modelCallCount", "model_call_count", "callCount", "call_count");
+  const points = new Map<string, { tokens: number; calls: number; hasCalls: boolean }>();
+  times.forEach((time, index) => {
+    const date = dateKey(time);
+    const tokenCount = numberValue(tokens[index]);
+    const callCount = calls ? numberValue(calls[index]) : undefined;
+    if (!date || tokenCount === undefined || tokenCount < 0) return;
+    addTokenActivityPoint(points, date, tokenCount, callCount);
+  });
+  return tokenActivity(points);
+}
+
 export function normalizeZhipuUsage(raw: unknown, planId: string): UsageSnapshot {
   if (!isObject(raw)) throw new Error("GLM usage response has an unexpected shape");
   if (raw.success === false || (numberValue(raw.code) ?? 200) >= 400) {
@@ -381,7 +525,9 @@ function kimiReset(value: unknown, detail: Record<string, unknown>): string | un
   const absolute = timestampIso(value, "iso");
   if (absolute) return absolute;
   const relative = numberValue(valueAt(detail, "reset_in", "resetIn", "ttl"));
-  return relative === undefined ? undefined : new Date(Date.now() + relative * 1000).toISOString();
+  if (relative === undefined) return undefined;
+  const rounded = Math.round((Date.now() + relative * 1000) / 60_000) * 60_000;
+  return new Date(rounded).toISOString();
 }
 
 function kimiWindowLabel(duration: number | undefined, unit: string | undefined, fallback: string): string {
@@ -432,6 +578,18 @@ function kimiWindow(raw: unknown, id: string, fallbackLabel: string): UsageWindo
   };
 }
 
+function kimiWindowId(raw: unknown, index: number): string {
+  if (!isObject(raw) || !isObject(raw.window)) return `window-${index}`;
+  const duration = numberValue(raw.window.duration);
+  const unit = stringValue(valueAt(raw.window, "timeUnit", "time_unit"));
+  if (duration === undefined || !unit) return `window-${index}`;
+  const normalizedUnit = unit.replace(/^TIME_UNIT_/i, "").toLowerCase();
+  if (normalizedUnit.startsWith("minute") && duration >= 60 && duration % 60 === 0) {
+    return `window-${duration / 60}-hour`;
+  }
+  return `window-${duration}-${normalizedUnit}`;
+}
+
 export function normalizeKimiUsage(raw: unknown, planId: string): UsageSnapshot {
   if (!isObject(raw)) throw new Error("Kimi usage response has an unexpected shape");
   if (raw.error !== undefined || raw.code === "access_terminated_error") {
@@ -442,8 +600,13 @@ export function normalizeKimiUsage(raw: unknown, planId: string): UsageSnapshot 
   }
   const windows: UsageWindow[] = [];
   if (Array.isArray(raw.limits)) {
+    const ids = new Map<string, number>();
     raw.limits.forEach((entry, index) => {
-      const window = kimiWindow(entry, `window-${index}`, `限流窗口 ${index + 1}`);
+      const baseId = kimiWindowId(entry, index);
+      const occurrence = (ids.get(baseId) ?? 0) + 1;
+      ids.set(baseId, occurrence);
+      const id = occurrence === 1 ? baseId : `${baseId}-${occurrence}`;
+      const window = kimiWindow(entry, id, `限流窗口 ${index + 1}`);
       if (window) windows.push(window);
     });
   }
@@ -460,11 +623,145 @@ export function normalizeKimiUsage(raw: unknown, planId: string): UsageSnapshot 
   };
 }
 
+function latestSampleWindow(
+  points: NonNullable<UsageSnapshot["quotaHistory"]>["points"],
+  windowId: string,
+): QuotaSampleWindow | undefined {
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    const match = points[index].windows.find((window) => window.id === windowId);
+    if (match) return match;
+  }
+  return undefined;
+}
+
+function resetAtChanged(previous: string | undefined, current: string | undefined): boolean {
+  if (!previous || !current) return false;
+  const previousTime = Date.parse(previous);
+  const currentTime = Date.parse(current);
+  if (Number.isFinite(previousTime) && Number.isFinite(currentTime)) {
+    return Math.abs(previousTime - currentTime) > 60_000;
+  }
+  return previous !== current;
+}
+
+export function appendKimiQuotaHistory(
+  snapshot: UsageSnapshot,
+  previous?: UsageSnapshot,
+  now = Date.now(),
+): UsageSnapshot {
+  const cutoff = now - LOCAL_QUOTA_HISTORY_RETENTION_MS;
+  const existing = previous?.quotaHistory?.source === "local"
+    ? previous.quotaHistory.points.filter((point) => {
+        const timestamp = Date.parse(point.sampledAt);
+        return Number.isFinite(timestamp) && timestamp >= cutoff && timestamp <= now;
+      })
+    : [];
+  const lastSampleAt = existing.length ? Date.parse(existing[existing.length - 1].sampledAt) : NaN;
+  const elapsed = now - lastSampleAt;
+  if (Number.isFinite(lastSampleAt) && elapsed >= 0 && elapsed < LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS * 1000) {
+    return {
+      ...snapshot,
+      quotaHistory: {
+        source: "local",
+        intervalSeconds: LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS,
+        points: existing,
+      },
+    };
+  }
+
+  const windows: QuotaSampleWindow[] = snapshot.windows.flatMap((window) => {
+    if (window.usedPercent === undefined || !Number.isFinite(window.usedPercent)) return [];
+    const usedPercent = Math.max(0, Math.min(100, window.usedPercent));
+    const prior = latestSampleWindow(existing, window.id);
+    const changedReset = resetAtChanged(prior?.resetAt, window.resetAt);
+    const usageDropped = prior !== undefined && usedPercent + 0.01 < prior.usedPercent;
+    return [{
+      id: window.id,
+      label: window.label,
+      usedPercent,
+      ...(window.resetAt ? { resetAt: window.resetAt } : {}),
+      ...(changedReset || usageDropped ? { reset: true } : {}),
+    }];
+  });
+  if (windows.length === 0 && existing.length === 0) return snapshot;
+  const points = windows.length
+    ? [...existing, { sampledAt: new Date(now).toISOString(), windows }]
+    : existing;
+  return {
+    ...snapshot,
+    quotaHistory: {
+      source: "local",
+      intervalSeconds: LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS,
+      points: points.slice(-LOCAL_QUOTA_HISTORY_MAX_POINTS),
+    },
+  };
+}
+
+function formatLocalDateTime(value: Date): string {
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+}
+
+function zhipuTokenActivityUrl(host: string, now = new Date()): string {
+  const start = new Date(now);
+  start.setDate(start.getDate() - 29);
+  start.setHours(0, 0, 0, 0);
+  const url = new URL(`https://${host}/api/monitor/usage/model-usage`);
+  url.searchParams.set("startTime", formatLocalDateTime(start));
+  url.searchParams.set("endTime", formatLocalDateTime(now));
+  return url.toString();
+}
+
+interface TokenActivityFetchResult {
+  tokenActivity?: TokenActivity;
+  tokenActivityStale: boolean;
+  tokenActivityError?: string;
+}
+
+async function optionalTokenActivity(
+  request: Promise<unknown>,
+  normalize: (raw: unknown) => TokenActivity,
+): Promise<TokenActivityFetchResult> {
+  try {
+    return { tokenActivity: normalize(await request), tokenActivityStale: false };
+  } catch (error) {
+    return { tokenActivityStale: true, tokenActivityError: safeError(error) };
+  }
+}
+
 function jwtExpiry(auth: Record<string, unknown>): number | undefined {
   const tokens = codexTokens(auth);
   const claims = parseJwtPayload(typeof tokens.access_token === "string" ? tokens.access_token : undefined);
   const expires = claims ? numberValue(claims.exp) : undefined;
   return expires === undefined ? undefined : expires * 1000;
+}
+
+function codexUsageHeaders(plan: Plan, secret: PlanSecret): Record<string, string> {
+  if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
+  const expiresAt = jwtExpiry(secret.auth);
+  if (expiresAt !== undefined && expiresAt <= Date.now()) {
+    throw new Error("Codex access token has expired; run Codex with this account, then re-import auth.json");
+  }
+  const tokens = codexTokens(secret.auth);
+  const accountId = plan.accountId ?? codexAccountId(secret.auth);
+  const idToken = typeof tokens.id_token === "string" ? tokens.id_token : undefined;
+  const claims = parseJwtPayload(idToken);
+  const namespaced = claims?.["https://api.openai.com/auth"];
+  const fedramp = isObject(namespaced) && namespaced.chatgpt_account_is_fedramp === true;
+  return {
+    Authorization: `Bearer ${String(tokens.access_token)}`,
+    "User-Agent": "paseo-coding-plan-manager/0.1.0",
+    ...(accountId ? { "ChatGPT-Account-ID": accountId } : {}),
+    ...(fedramp ? { "X-OpenAI-Fedramp": "true" } : {}),
+  };
+}
+
+function zhipuHost(plan: Plan): string {
+  return plan.region === "global"
+    ? "api.z.ai"
+    : plan.region === "cn-dev"
+      ? "dev.bigmodel.cn"
+      : "open.bigmodel.cn";
 }
 
 async function fetchPlanUsage(
@@ -475,26 +772,9 @@ async function fetchPlanUsage(
   const dispatcher = usageDispatcherPool.dispatcher(plan.useProxy);
 
   if (plan.provider === "codex") {
-    if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
-    const expiresAt = jwtExpiry(secret.auth);
-    if (expiresAt !== undefined && expiresAt <= Date.now()) {
-      throw new Error("Codex access token has expired; run Codex with this account, then re-import auth.json");
-    }
-    const tokens = codexTokens(secret.auth);
-    const accessToken = String(tokens.access_token);
-    const accountId = plan.accountId ?? codexAccountId(secret.auth);
-    const idToken = typeof tokens.id_token === "string" ? tokens.id_token : undefined;
-    const claims = parseJwtPayload(idToken);
-    const namespaced = claims?.["https://api.openai.com/auth"];
-    const fedramp = isObject(namespaced) && namespaced.chatgpt_account_is_fedramp === true;
     const raw = await fetchJson(
       "https://chatgpt.com/backend-api/wham/usage",
-      {
-        Authorization: `Bearer ${accessToken}`,
-        "User-Agent": "paseo-coding-plan-manager/0.1.0",
-        ...(accountId ? { "ChatGPT-Account-ID": accountId } : {}),
-        ...(fedramp ? { "X-OpenAI-Fedramp": "true" } : {}),
-      },
+      codexUsageHeaders(plan, secret),
       ["chatgpt.com"],
       deadline,
       dispatcher,
@@ -518,18 +798,15 @@ async function fetchPlanUsage(
     return normalizeKimiUsage(raw, plan.id);
   }
 
-  const host = plan.region === "global"
-    ? "api.z.ai"
-    : plan.region === "cn-dev"
-      ? "dev.bigmodel.cn"
-      : "open.bigmodel.cn";
+  const host = zhipuHost(plan);
+  const headers = {
+    Authorization: secret.apiKey,
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    Accept: "application/json",
+  };
   const raw = await fetchJson(
     `https://${host}/api/monitor/usage/quota/limit`,
-    {
-      Authorization: secret.apiKey,
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      Accept: "application/json",
-    },
+    headers,
     ["open.bigmodel.cn", "dev.bigmodel.cn", "api.z.ai"],
     deadline,
     dispatcher,
@@ -537,9 +814,76 @@ async function fetchPlanUsage(
   return normalizeZhipuUsage(raw, plan.id);
 }
 
+async function fetchPlanTokenActivity(
+  plan: Plan,
+  secret: PlanSecret,
+  deadline: number,
+): Promise<TokenActivityFetchResult | undefined> {
+  if (plan.provider === "kimi") return undefined;
+  try {
+    const dispatcher = usageDispatcherPool.dispatcher(plan.useProxy);
+    if (plan.provider === "codex") {
+      return optionalTokenActivity(
+        fetchJson(
+          "https://chatgpt.com/backend-api/wham/profiles/me",
+          codexUsageHeaders(plan, secret),
+          ["chatgpt.com"],
+          deadline,
+          dispatcher,
+          { attempts: 1, timeoutMs: HISTORY_REQUEST_BUDGET_MS },
+        ),
+        normalizeCodexTokenActivity,
+      );
+    }
+    if (secret.kind !== "api-key") throw new Error("API key is missing");
+    const host = zhipuHost(plan);
+    return optionalTokenActivity(
+      fetchJson(
+        zhipuTokenActivityUrl(host),
+        {
+          Authorization: secret.apiKey,
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          Accept: "application/json",
+        },
+        ["open.bigmodel.cn", "dev.bigmodel.cn", "api.z.ai"],
+        deadline,
+        dispatcher,
+        { attempts: 1, timeoutMs: HISTORY_REQUEST_BUDGET_MS },
+      ),
+      normalizeZhipuTokenActivity,
+    );
+  } catch (error) {
+    return { tokenActivityStale: true, tokenActivityError: safeError(error) };
+  }
+}
+
 function safeError(error: unknown): string {
   const message = error instanceof Error ? error.message : "Usage refresh failed";
   return message.replace(/[\r\n]+/g, " ").slice(0, 300);
+}
+
+function mergeUsageHistory(
+  plan: Plan,
+  snapshot: UsageSnapshot,
+  previous?: UsageSnapshot,
+): UsageSnapshot {
+  let merged = snapshot;
+  if (!snapshot.tokenActivity && snapshot.tokenActivityError && previous?.tokenActivity) {
+    merged = {
+      ...snapshot,
+      tokenActivity: previous.tokenActivity,
+      tokenActivityStale: true,
+    };
+  }
+  if (plan.provider === "kimi") {
+    const fetchedAt = Date.parse(snapshot.fetchedAt);
+    return appendKimiQuotaHistory(
+      merged,
+      previous,
+      Number.isFinite(fetchedAt) ? fetchedAt : Date.now(),
+    );
+  }
+  return merged;
 }
 
 export async function cachedUsage(store: PlanStore = planStore): Promise<UsageSnapshot[]> {
@@ -590,8 +934,35 @@ export async function refreshUsageSnapshots(
   });
   await Promise.all(workers);
 
+  const historyIndexes = snapshots
+    .map((snapshot, index) => ({ snapshot, index }))
+    .filter(({ snapshot, index }) => (
+      snapshot.plan.provider !== "kimi" && results[index]?.status === "ok"
+    ));
+  const historyDeadline = Date.now() + HISTORY_REQUEST_BUDGET_MS;
+  let historyCursor = 0;
+  const historyWorkers = Array.from({ length: Math.min(4, historyIndexes.length) }, async () => {
+    while (historyCursor < historyIndexes.length) {
+      const cursorIndex = historyCursor;
+      historyCursor += 1;
+      const { snapshot, index } = historyIndexes[cursorIndex];
+      const activity = await fetchPlanTokenActivity(snapshot.plan, snapshot.secret, historyDeadline);
+      if (activity) results[index] = { ...results[index], ...activity };
+    }
+  });
+  await Promise.all(historyWorkers);
+
+  results.forEach((result, index) => {
+    if (result.status !== "ok") return;
+    const plan = snapshots[index].plan;
+    results[index] = mergeUsageHistory(plan, result, previousByPlan.get(plan.id));
+  });
+
   const startedPlans = new Map(plans.map((plan) => [plan.id, plan.updatedAt]));
   const successful = results.filter((snapshot) => snapshot.status === "ok");
   const currentPlanIds = await store.mergeUsageCache(successful, startedPlans);
-  return results.filter((snapshot) => currentPlanIds.has(snapshot.planId));
+  const cachedByPlan = new Map((await store.readUsageCache()).map((snapshot) => [snapshot.planId, snapshot]));
+  return results
+    .filter((snapshot) => currentPlanIds.has(snapshot.planId))
+    .map((snapshot) => snapshot.status === "ok" ? cachedByPlan.get(snapshot.planId) ?? snapshot : snapshot);
 }

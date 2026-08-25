@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ActiveTargets, Plan, Provider, Target } from "../plans.shared";
+import type { ActiveTargets, Plan, Provider, Target, UsageSnapshot } from "../plans.shared";
 import { PlanStore } from "../store.server";
 
 function storedPlan(id: string, provider: Provider): Plan {
@@ -206,6 +206,152 @@ test("v4 parsing rejects malformed, dangling, wrong-provider, and ambiguous refe
       codex: null,
       claude: null,
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("metadata-only edits preserve local history while credential changes clear it", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-history-edit-"));
+  try {
+    const store = new PlanStore(root);
+    const plan = await saveProviderPlan(store, "kimi", "Kimi history");
+    const usage: UsageSnapshot = {
+      planId: plan.id,
+      status: "ok",
+      stale: false,
+      fetchedAt: "2026-08-25T00:00:00.000Z",
+      windows: [],
+      quotaHistory: {
+        source: "local",
+        intervalSeconds: 300,
+        points: [{
+          sampledAt: "2026-08-25T00:00:00.000Z",
+          windows: [{ id: "weekly", label: "每周", usedPercent: 10 }],
+        }],
+      },
+    };
+    await store.writeUsageCache([usage]);
+
+    await store.savePlan({
+      id: plan.id,
+      label: "Kimi renamed",
+      provider: "kimi",
+      useProxy: true,
+    });
+    assert.deepEqual(await store.readUsageCache(), [usage]);
+
+    await store.savePlan({
+      id: plan.id,
+      label: "Kimi replacement account",
+      provider: "kimi",
+      apiKey: "replacement-secret",
+    });
+    assert.deepEqual(await store.readUsageCache(), []);
+
+    await unlink(path.join(root, "secrets", `${plan.id}.json`));
+    const repaired = await store.savePlan({
+      id: plan.id,
+      label: "Kimi repaired",
+      provider: "kimi",
+      apiKey: "repaired-secret",
+    });
+    assert.equal(repaired.label, "Kimi repaired");
+    assert.equal((await store.readSecret(plan.id)).kind, "api-key");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cache merges do not roll provider activity or local samples backward", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-history-merge-"));
+  try {
+    const store = new PlanStore(root);
+    const plan = await saveProviderPlan(store, "zhipu", "History merge");
+    const expected = new Map([[plan.id, plan.updatedAt]]);
+    const firstAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const secondAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    const concurrentAt = new Date(Date.parse(secondAt) + 10_000).toISOString();
+    const expiredAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    const base: UsageSnapshot = {
+      planId: plan.id,
+      status: "ok",
+      stale: false,
+      fetchedAt: firstAt,
+      windows: [],
+      tokenActivity: {
+        source: "provider",
+        granularity: "day",
+        points: [{ date: "2026-08-25", tokens: 500 }],
+      },
+      tokenActivityStale: false,
+      quotaHistory: {
+        source: "local",
+        intervalSeconds: 300,
+        points: [{
+          sampledAt: firstAt,
+          windows: [{ id: "weekly", label: "每周", usedPercent: 10 }],
+        }],
+      },
+    };
+    await store.mergeUsageCache([base], expected);
+    await store.mergeUsageCache([{
+      ...base,
+      fetchedAt: secondAt,
+      tokenActivity: {
+        source: "provider",
+        granularity: "day",
+        points: [{ date: "2026-08-25", tokens: 100 }],
+      },
+      tokenActivityStale: true,
+      tokenActivityError: "history request failed",
+      quotaHistory: {
+        source: "local",
+        intervalSeconds: 300,
+        points: [
+          {
+            sampledAt: expiredAt,
+            windows: [{ id: "weekly", label: "每周", usedPercent: 5 }],
+          },
+          {
+            sampledAt: secondAt,
+            windows: [{ id: "weekly", label: "每周", usedPercent: 15 }],
+          },
+        ],
+      },
+    }], expected);
+
+    await store.mergeUsageCache([{
+      ...base,
+      fetchedAt: firstAt,
+      tokenActivity: {
+        source: "provider",
+        granularity: "day",
+        points: [{ date: "2026-08-25", tokens: 50 }],
+      },
+    }], expected);
+    await store.mergeUsageCache([{
+      ...base,
+      fetchedAt: concurrentAt,
+      tokenActivityStale: true,
+      tokenActivityError: "overlapping history request failed",
+      quotaHistory: {
+        source: "local",
+        intervalSeconds: 300,
+        points: [{
+          sampledAt: concurrentAt,
+          windows: [{ id: "weekly", label: "每周", usedPercent: 16 }],
+        }],
+      },
+    }], expected);
+
+    const [merged] = await store.readUsageCache();
+    assert.equal(merged.tokenActivity?.points[0].tokens, 500);
+    assert.equal(merged.tokenActivityStale, true);
+    assert.deepEqual(
+      merged.quotaHistory?.points.map((point) => point.sampledAt),
+      [firstAt, secondAt],
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -22,8 +22,11 @@ import {
   type Dashboard,
   type Plan,
   type Provider,
+  type QuotaHistory,
   type SavePlanInput,
   type Target,
+  type TokenActivity,
+  type TokenActivityPoint,
   type UsageSnapshot,
   type UsageWindow,
   type ZhipuRegion,
@@ -175,6 +178,71 @@ function usageDetail(window: UsageWindow): string {
   }
   if (window.remaining !== undefined) return `剩余 ${displayNumber(window.remaining)}`;
   return window.usedPercent !== undefined ? `${Math.round(window.usedPercent)}% 已使用` : "额度未知";
+}
+
+function compactNumber(value: number): string {
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(value >= 10_000_000_000 ? 0 : 1)}B`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}K`;
+  return Math.round(value).toLocaleString();
+}
+
+function localDateKey(value: Date): string {
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+}
+
+function activityRange(activity: TokenActivity, days: 7 | 30): TokenActivityPoint[] {
+  const byDate = new Map(activity.points.map((point) => [point.date, point]));
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (days - index - 1));
+    const key = localDateKey(date);
+    return byDate.get(key) ?? { date: key, tokens: 0 };
+  });
+}
+
+function shortDate(date: string): string {
+  const match = date.match(/^\d{4}-(\d{2})-(\d{2})$/);
+  return match ? `${Number(match[1])}/${Number(match[2])}` : date;
+}
+
+function shortTimestamp(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function historyTimestamp(value: string, includeTime: boolean): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  const date = new Date(timestamp);
+  return includeTime
+    ? date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+    : `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+function downsample<T>(values: T[], limit: number): T[] {
+  if (values.length <= limit) return values;
+  return Array.from({ length: limit }, (_, index) => (
+    values[Math.round((index * (values.length - 1)) / (limit - 1))]
+  ));
+}
+
+function axisIndexes(length: number, count: number): number[] {
+  const tickCount = Math.min(length, count);
+  if (tickCount <= 0) return [];
+  if (tickCount === 1) return [0];
+  return [...new Set(Array.from({ length: tickCount }, (_, index) => (
+    Math.round((index * (length - 1)) / (tickCount - 1))
+  )))];
 }
 
 function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolean) {
@@ -479,6 +547,159 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     reset: {
       color: theme.colors.foregroundMuted,
       fontSize: 10,
+    },
+    historySection: {
+      borderTopWidth: 1,
+      borderTopColor: theme.colors.foregroundMuted,
+      paddingTop: 12,
+      gap: 9,
+    },
+    historyHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      flexWrap: "wrap",
+      gap: 7,
+    },
+    historyTitleRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: 6,
+    },
+    historyTitle: {
+      color: theme.colors.foreground,
+      fontSize: 11,
+      fontWeight: "800",
+    },
+    historySource: {
+      color: theme.colors.accent,
+      fontSize: 8,
+      fontWeight: "800",
+      letterSpacing: 0.5,
+      textTransform: "uppercase",
+    },
+    historyRange: {
+      flexDirection: "row",
+      gap: 3,
+    },
+    historyRangeButton: {
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+    },
+    historyRangeButtonActive: {
+      borderColor: theme.colors.accent,
+      backgroundColor: theme.colors.accent,
+    },
+    historyRangeText: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 8,
+      fontWeight: "800",
+    },
+    historyRangeTextActive: {
+      color: theme.colors.accentForeground,
+    },
+    historySummary: {
+      color: theme.colors.foreground,
+      fontSize: 10,
+      fontWeight: "700",
+    },
+    historyChart: {
+      gap: 3,
+    },
+    historyChartBody: {
+      height: 58,
+      flexDirection: "row",
+      alignItems: "stretch",
+      gap: 3,
+    },
+    historyYAxis: {
+      width: 22,
+      flexShrink: 0,
+      justifyContent: "space-between",
+      alignItems: "flex-end",
+      paddingVertical: 1,
+    },
+    historyYAxisText: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 8,
+      lineHeight: 9,
+    },
+    historyPlot: {
+      flex: 1,
+      minWidth: 0,
+      position: "relative",
+      borderLeftWidth: 1,
+      borderBottomWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+    },
+    historyGrid: {
+      position: "absolute",
+      top: 0,
+      right: 0,
+      bottom: 0,
+      left: 0,
+      justifyContent: "space-between",
+    },
+    historyGridLine: {
+      height: 1,
+      backgroundColor: theme.colors.foregroundMuted,
+      opacity: 0.25,
+    },
+    historyBars: {
+      flex: 1,
+      height: "100%",
+      flexDirection: "row",
+      alignItems: "flex-end",
+      gap: 2,
+    },
+    historyBarSlot: {
+      flex: 1,
+      minWidth: 1,
+      height: "100%",
+      justifyContent: "flex-end",
+    },
+    historyBar: {
+      width: "100%",
+      minHeight: 1,
+      backgroundColor: theme.colors.accent,
+    },
+    historyBarEmpty: {
+      backgroundColor: theme.colors.foregroundMuted,
+      opacity: 0.45,
+    },
+    historyBarReset: {
+      borderTopWidth: 2,
+      borderTopColor: theme.colors.statusDanger,
+    },
+    historyAxis: {
+      marginLeft: 25,
+      flexDirection: "row",
+      justifyContent: "space-between",
+      alignItems: "center",
+    },
+    historyAxisText: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 8,
+    },
+    quotaHistoryList: {
+      gap: 11,
+    },
+    quotaHistoryItem: {
+      gap: 5,
+    },
+    quotaHistoryHeader: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      flexWrap: "wrap",
+      gap: 5,
+    },
+    quotaHistoryDelta: {
+      color: theme.colors.accent,
+      fontSize: 9,
+      fontWeight: "800",
     },
     error: {
       color: theme.colors.statusDanger,
@@ -949,6 +1170,261 @@ function Quota({ window, styles }: { window: UsageWindow; styles: Styles }) {
   );
 }
 
+interface HistoryBarValue {
+  key: string;
+  value: number;
+  label: string;
+  axisLabel: string;
+  reset?: boolean;
+}
+
+function HistoryBars({
+  values,
+  maxValue,
+  styles,
+}: {
+  values: HistoryBarValue[];
+  maxValue: number;
+  styles: Styles;
+}) {
+  return (
+    <View style={styles.historyBars}>
+      {values.map((value) => {
+        const height = value.value > 0 && maxValue > 0
+          ? `${Math.max(4, Math.min(100, (value.value / maxValue) * 100))}%` as `${number}%`
+          : 1;
+        return (
+          <View
+            key={value.key}
+            accessible
+            accessibilityLabel={value.label}
+            style={styles.historyBarSlot}
+          >
+            <View
+              style={[
+                styles.historyBar,
+                value.value <= 0 && styles.historyBarEmpty,
+                value.reset && styles.historyBarReset,
+                { height },
+              ]}
+            />
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+function HistoryChart({
+  values,
+  maxValue,
+  xTickCount,
+  formatY,
+  styles,
+}: {
+  values: HistoryBarValue[];
+  maxValue: number;
+  xTickCount: number;
+  formatY: (value: number) => string;
+  styles: Styles;
+}) {
+  const yTicks = [maxValue, maxValue / 2, 0];
+  const xTicks = axisIndexes(values.length, xTickCount).map((index) => values[index]);
+  return (
+    <View style={styles.historyChart}>
+      <View style={styles.historyChartBody}>
+        <View style={styles.historyYAxis}>
+          {yTicks.map((tick, index) => (
+            <Text key={`${tick}-${index}`} style={styles.historyYAxisText}>{formatY(tick)}</Text>
+          ))}
+        </View>
+        <View style={styles.historyPlot}>
+          <View pointerEvents="none" style={styles.historyGrid}>
+            {[0, 1, 2].map((line) => <View key={line} style={styles.historyGridLine} />)}
+          </View>
+          <HistoryBars values={values} maxValue={maxValue} styles={styles} />
+        </View>
+      </View>
+      <View style={styles.historyAxis}>
+        {xTicks.map((tick) => (
+          <Text key={tick.key} style={styles.historyAxisText}>{tick.axisLabel}</Text>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function TokenActivityHistory({
+  activity,
+  stale,
+  error,
+  days,
+  setDays,
+  styles,
+}: {
+  activity?: TokenActivity;
+  stale?: boolean;
+  error?: string;
+  days: 7 | 30;
+  setDays: (days: 7 | 30) => void;
+  styles: Styles;
+}) {
+  const points = activity ? activityRange(activity, days) : [];
+  const knownDates = new Set(activity?.points.map((point) => point.date) ?? []);
+  const hasRangeData = points.some((point) => knownDates.has(point.date));
+  const totalTokens = points.reduce((total, point) => total + point.tokens, 0);
+  const calls = points.reduce((total, point) => total + (point.calls ?? 0), 0);
+  const hasCalls = points.some((point) => point.calls !== undefined);
+  const maxTokens = Math.max(0, ...points.map((point) => point.tokens));
+  return (
+    <View style={styles.historySection}>
+      <View style={styles.historyHeader}>
+        <View style={styles.historyTitleRow}>
+          <Text style={styles.historyTitle}>Token 活动</Text>
+          <Text style={styles.historySource}>{stale ? "服务端缓存" : "服务端按日"}</Text>
+        </View>
+        <View style={styles.historyRange}>
+          {([7, 30] as const).map((range) => (
+            <Pressable
+              key={range}
+              accessibilityRole="button"
+              accessibilityState={{ selected: days === range }}
+              onPress={() => setDays(range)}
+              style={({ pressed }) => [
+                styles.historyRangeButton,
+                days === range && styles.historyRangeButtonActive,
+                pressed && styles.buttonPressed,
+              ]}
+            >
+              <Text style={[styles.historyRangeText, days === range && styles.historyRangeTextActive]}>
+                {range} 天
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      </View>
+      {activity && hasRangeData ? (
+        <>
+          <Text style={styles.historySummary}>
+            {days} 天共 {compactNumber(totalTokens)} tokens{hasCalls ? ` · ${compactNumber(calls)} 次调用` : ""}
+          </Text>
+          <HistoryChart
+            values={points.map((point) => ({
+              key: point.date,
+              value: point.tokens,
+              axisLabel: shortDate(point.date),
+              label: `${point.date}：${point.tokens.toLocaleString()} tokens${point.calls === undefined ? "" : `，${point.calls.toLocaleString()} 次调用`}`,
+            }))}
+            maxValue={maxTokens}
+            xTickCount={days === 7 ? 4 : 5}
+            formatY={compactNumber}
+            styles={styles}
+          />
+        </>
+      ) : (
+        <Text style={styles.muted}>
+          {activity ? `服务端暂无最近 ${days} 天的 Token 记录。` : "等待首次历史用量刷新。"}
+        </Text>
+      )}
+      {error ? <Text style={styles.error}>历史用量：{error}</Text> : null}
+    </View>
+  );
+}
+
+function LocalQuotaHistory({
+  history,
+  currentWindows,
+  styles,
+}: {
+  history?: QuotaHistory;
+  currentWindows: UsageWindow[];
+  styles: Styles;
+}) {
+  const latestWindows = history?.points[history.points.length - 1]?.windows ?? [];
+  const candidates = (currentWindows.length ? currentWindows : latestWindows)
+    .filter((window) => window.usedPercent !== undefined)
+    .sort((left, right) => {
+      const rank = (window: { id: string; label: string }) => (
+        window.label === "5 小时" ? 0 : window.id === "weekly" || window.label === "每周" ? 1 : 2
+      );
+      return rank(left) - rank(right);
+    })
+    .slice(0, 3);
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const historySeries = history
+    ? candidates.flatMap((window) => {
+        const series = history.points.flatMap((point) => {
+          const sample = point.windows.find((candidate) => candidate.id === window.id);
+          const sampledAt = Date.parse(point.sampledAt);
+          return sample && Number.isFinite(sampledAt) && sampledAt >= cutoff
+            ? [{ sampledAt: point.sampledAt, ...sample }]
+            : [];
+        });
+        return series.length ? [{ window, series }] : [];
+      })
+    : [];
+  return (
+    <View style={styles.historySection}>
+      <View style={styles.historyHeader}>
+        <View style={styles.historyTitleRow}>
+          <Text style={styles.historyTitle}>配额变化</Text>
+          <Text style={styles.historySource}>本机 · 5 分钟</Text>
+        </View>
+        <Text style={styles.historyAxisText}>保留 7 天</Text>
+      </View>
+      {historySeries.length ? (
+        <View style={styles.quotaHistoryList}>
+          {historySeries.map(({ window, series }) => {
+            let cycleStart = 0;
+            for (let index = series.length - 1; index >= 0; index -= 1) {
+              if (series[index].reset) {
+                cycleStart = index;
+                break;
+              }
+            }
+            const currentCycle = series.slice(cycleStart);
+            const delta = Math.max(
+              0,
+              currentCycle[currentCycle.length - 1].usedPercent - currentCycle[0].usedPercent,
+            );
+            const chart = downsample(series, 36);
+            const resetCount = series.filter((sample) => sample.reset).length;
+            const chartSpan = Date.parse(series[series.length - 1].sampledAt) - Date.parse(series[0].sampledAt);
+            const includeTime = Number.isFinite(chartSpan) && chartSpan < 24 * 60 * 60 * 1000;
+            return (
+              <View key={window.id} style={styles.quotaHistoryItem}>
+                <View style={styles.quotaHistoryHeader}>
+                  <Text style={styles.quotaLabel}>{window.label}</Text>
+                  <Text style={styles.quotaHistoryDelta}>
+                    {currentCycle.length > 1 ? `本周期 +${delta.toFixed(delta >= 10 ? 0 : 1)} 个百分点` : "已记录周期起点"}
+                    {resetCount ? ` · ${resetCount} 次重置` : ""}
+                  </Text>
+                </View>
+                <HistoryChart
+                  values={chart.map((sample, index) => ({
+                    key: `${sample.sampledAt}-${index}`,
+                    value: sample.usedPercent,
+                    reset: sample.reset,
+                    axisLabel: historyTimestamp(sample.sampledAt, includeTime),
+                    label: `${shortTimestamp(sample.sampledAt)}：${Math.round(sample.usedPercent)}% 已使用${sample.reset ? "，窗口已重置" : ""}`,
+                  }))}
+                  maxValue={100}
+                  xTickCount={4}
+                  formatY={(value) => `${Math.round(value)}%`}
+                  styles={styles}
+                />
+              </View>
+            );
+          })}
+        </View>
+      ) : (
+        <Text style={styles.muted}>首次成功刷新后开始记录；每 5 分钟至多保存一个快照。</Text>
+      )}
+      <Text style={styles.muted}>这里记录套餐配额百分比，不是 Token 数量；关闭面板期间不会主动请求。</Text>
+    </View>
+  );
+}
+
 function PlanCard({
   plan,
   usage,
@@ -992,6 +1468,7 @@ function PlanCard({
       : dashboard.activeTargets[target] === plan.id,
   );
   const [targetError, setTargetError] = useState<string | null>(null);
+  const [activityDays, setActivityDays] = useState<7 | 30>(7);
   const modelCandidates = applyDraft
     ? [...new Set([...modelCandidatesFor(plan.provider, applyDraft.target), ...applyDraft.models])]
     : [];
@@ -1091,6 +1568,22 @@ function PlanCard({
       )}
       {usage?.parallelLimit ? <Text style={styles.muted}>并发上限 {usage.parallelLimit}</Text> : null}
       {usage?.balance ? <Text style={styles.muted}>Credits 余额 {usage.balance}</Text> : null}
+      {plan.provider === "kimi" ? (
+        <LocalQuotaHistory
+          history={usage?.quotaHistory}
+          currentWindows={usage?.windows ?? []}
+          styles={styles}
+        />
+      ) : (
+        <TokenActivityHistory
+          activity={usage?.tokenActivity}
+          stale={usage?.tokenActivityStale}
+          error={usage?.tokenActivityError}
+          days={activityDays}
+          setDays={setActivityDays}
+          styles={styles}
+        />
+      )}
       {usage?.error ? <Text style={styles.error}>{usage.error}</Text> : null}
 
       {applyDraft ? (

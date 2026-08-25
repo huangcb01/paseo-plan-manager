@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  appendKimiQuotaHistory,
   normalizeCodexUsage,
+  normalizeCodexTokenActivity,
   normalizeKimiUsage,
+  normalizeZhipuTokenActivity,
   normalizeZhipuUsage,
 } from "../usage.server";
 
@@ -157,4 +160,135 @@ test("rejects failed GLM envelopes", () => {
     () => normalizeZhipuUsage({ success: false, code: 401, data: {} }, "glm-1"),
     /rejected/,
   );
+});
+
+test("normalizes Codex daily token activity and merges duplicate dates", () => {
+  const result = normalizeCodexTokenActivity({
+    stats: {
+      lifetime_tokens: 1000,
+      daily_usage_buckets: [
+        { start_date: "2026-08-24", tokens: 120 },
+        { startDate: "2026-08-24", tokens: 30 },
+        { start_date: "2026-08-25", tokens: "250" },
+        { start_date: "invalid", tokens: 999 },
+      ],
+    },
+  });
+
+  assert.deepEqual(result, {
+    source: "provider",
+    granularity: "day",
+    points: [
+      { date: "2026-08-24", tokens: 150 },
+      { date: "2026-08-25", tokens: 250 },
+    ],
+  });
+});
+
+test("accepts top-level Codex buckets but preserves cache on omitted or failed stats", () => {
+  const topLevel = normalizeCodexTokenActivity({
+    stats: { lifetime_tokens: 500 },
+    daily_usage_buckets: [{ start_date: "2026-08-25", tokens: 500 }],
+  });
+  assert.deepEqual(topLevel.points, [{ date: "2026-08-25", tokens: 500 }]);
+  assert.deepEqual(normalizeCodexTokenActivity({ stats: { daily_usage_buckets: null } }).points, []);
+  assert.throws(
+    () => normalizeCodexTokenActivity({ stats: { lifetime_tokens: 500 } }),
+    /omitted daily buckets/,
+  );
+  assert.throws(
+    () => normalizeCodexTokenActivity({
+      metadata: { stats_error: "temporarily unavailable" },
+      stats: { daily_usage_buckets: [] },
+    }),
+    /temporarily unavailable/,
+  );
+});
+
+test("aggregates GLM hourly token and call buckets by calendar day", () => {
+  const result = normalizeZhipuTokenActivity({
+    code: 200,
+    data: {
+      x_time: [
+        "2026-08-24 09:00:00",
+        "2026-08-24 10:00:00",
+        "2026-08-25 09:00:00",
+      ],
+      tokensUsage: [100, "250", 400],
+      modelCallCount: [1, 2, 4],
+    },
+  });
+
+  assert.deepEqual(result.points, [
+    { date: "2026-08-24", tokens: 350, calls: 3 },
+    { date: "2026-08-25", tokens: 400, calls: 4 },
+  ]);
+});
+
+test("samples Kimi quota at most every five minutes and marks resets", () => {
+  const start = Date.parse("2026-08-25T00:00:00.000Z");
+  const kimiSnapshot = (used: number, resetTime: string) => normalizeKimiUsage({
+    usage: { used, limit: 100, resetTime },
+  }, "kimi-history");
+
+  const first = appendKimiQuotaHistory(
+    kimiSnapshot(10, "2026-09-01T00:00:00.000Z"),
+    undefined,
+    start,
+  );
+  assert.equal(first.quotaHistory?.points.length, 1);
+  assert.equal(first.quotaHistory?.points[0].windows[0].usedPercent, 10);
+
+  const throttled = appendKimiQuotaHistory(
+    kimiSnapshot(20, "2026-09-01T00:00:00.000Z"),
+    first,
+    start + 4 * 60_000,
+  );
+  assert.equal(throttled.quotaHistory?.points.length, 1);
+
+  const second = appendKimiQuotaHistory(
+    kimiSnapshot(25, "2026-09-01T00:00:00.000Z"),
+    throttled,
+    start + 5 * 60_000,
+  );
+  assert.equal(second.quotaHistory?.points.length, 2);
+  assert.equal(second.quotaHistory?.points[1].windows[0].reset, undefined);
+
+  const reset = appendKimiQuotaHistory(
+    kimiSnapshot(3, "2026-09-08T00:00:00.000Z"),
+    second,
+    start + 10 * 60_000,
+  );
+  assert.equal(reset.quotaHistory?.points.length, 3);
+  assert.equal(reset.quotaHistory?.points[2].windows[0].usedPercent, 3);
+  assert.equal(reset.quotaHistory?.points[2].windows[0].reset, true);
+});
+
+test("uses stable Kimi rate-window IDs and ignores small reset-time jitter", () => {
+  const fiveHour = {
+    window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
+    detail: { used: 20, limit: 100, resetTime: "2026-08-25T05:00:00.000Z" },
+  };
+  const oneMinute = {
+    window: { duration: 1, timeUnit: "TIME_UNIT_MINUTE" },
+    detail: { used: 1, limit: 10, resetTime: "2026-08-25T00:01:00.000Z" },
+  };
+  const firstOrder = normalizeKimiUsage({ limits: [fiveHour, oneMinute] }, "kimi-stable");
+  const secondOrder = normalizeKimiUsage({ limits: [oneMinute, fiveHour] }, "kimi-stable");
+  assert.deepEqual(
+    new Map(firstOrder.windows.map((window) => [window.label, window.id])),
+    new Map(secondOrder.windows.map((window) => [window.label, window.id])),
+  );
+  assert.equal(firstOrder.windows[0].id, "window-5-hour");
+
+  const start = Date.parse("2026-08-25T00:00:00.000Z");
+  const initial = appendKimiQuotaHistory(firstOrder, undefined, start);
+  const jittered = normalizeKimiUsage({
+    limits: [{
+      ...fiveHour,
+      detail: { ...fiveHour.detail, used: 30, resetTime: "2026-08-25T05:00:30.000Z" },
+    }],
+  }, "kimi-stable");
+  const next = appendKimiQuotaHistory(jittered, initial, start + 5 * 60_000);
+  assert.equal(next.quotaHistory?.points[1].windows[0].reset, undefined);
 });

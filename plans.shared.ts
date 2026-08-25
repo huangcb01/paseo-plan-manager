@@ -40,6 +40,37 @@ export const UsageWindowSchema = z.object({
   windowSeconds: z.number().optional(),
 });
 
+export const TokenActivityPointSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  tokens: z.number().nonnegative(),
+  calls: z.number().int().nonnegative().optional(),
+});
+
+export const TokenActivitySchema = z.object({
+  source: z.literal("provider"),
+  granularity: z.literal("day"),
+  points: z.array(TokenActivityPointSchema),
+});
+
+export const QuotaSampleWindowSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  usedPercent: z.number().min(0).max(100),
+  resetAt: z.string().optional(),
+  reset: z.boolean().optional(),
+});
+
+export const QuotaSampleSchema = z.object({
+  sampledAt: z.string(),
+  windows: z.array(QuotaSampleWindowSchema),
+});
+
+export const QuotaHistorySchema = z.object({
+  source: z.literal("local"),
+  intervalSeconds: z.number().int().positive(),
+  points: z.array(QuotaSampleSchema),
+});
+
 export const UsageSnapshotSchema = z.object({
   planId: z.string(),
   status: z.enum(["ok", "error"]),
@@ -49,6 +80,10 @@ export const UsageSnapshotSchema = z.object({
   windows: z.array(UsageWindowSchema),
   parallelLimit: z.string().optional(),
   balance: z.string().optional(),
+  tokenActivity: TokenActivitySchema.optional(),
+  tokenActivityStale: z.boolean().optional(),
+  tokenActivityError: z.string().optional(),
+  quotaHistory: QuotaHistorySchema.optional(),
   error: z.string().optional(),
 });
 
@@ -146,6 +181,11 @@ export type Plan = z.infer<typeof PlanSchema>;
 export type SavePlanInput = z.infer<typeof SavePlanInputSchema>;
 export type ApplyPlanInput = z.infer<typeof ApplyPlanInputSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
+export type TokenActivityPoint = z.infer<typeof TokenActivityPointSchema>;
+export type TokenActivity = z.infer<typeof TokenActivitySchema>;
+export type QuotaSampleWindow = z.infer<typeof QuotaSampleWindowSchema>;
+export type QuotaSample = z.infer<typeof QuotaSampleSchema>;
+export type QuotaHistory = z.infer<typeof QuotaHistorySchema>;
 export type UsageSnapshot = z.infer<typeof UsageSnapshotSchema>;
 export type Dashboard = z.infer<typeof DashboardSchema>;
 export type ApplyPlanResult = z.infer<typeof ApplyPlanResultSchema>;

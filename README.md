@@ -10,6 +10,7 @@
 - 管理界面打开期间每 60 秒自动刷新，也可手动刷新。
 - 每个 Plan 可独立选择用量查询直连或使用 Paseo daemon 的网络代理。
 - 展示 Codex 主/次/附加限额、智谱新 `CREDIT_LIMIT` 与旧 `TOKENS_LIMIT` 的 5 小时/周窗口及 MCP 限额、Kimi 周额度/全部限流窗口/并发上限。
+- Codex 和智谱额外展示服务端 7/30 天 Token 活动；Kimi 每 5 分钟至多保存一个本地配额快照并保留 7 天。
 - 应用 Plan 时再为目标工具选择 1–16 个模型，首个作为当前默认；模型列表仅用于本次写入，不保存到 Plan。
 - 将所选模型写入 OpenCode 自定义 provider、智谱 Codex 模型目录或 Claude Code model picker，同时保留无关配置和 JSONC 注释。
 - 检测 `opencode`、`codex`、`claude` 是否存在；插件不包含、下载或安装任何 CLI。
@@ -63,11 +64,17 @@ paseo plugin reload coding-plan-manager
 - Global / Z.AI：`api.z.ai`
 - 中国区 Dev：`dev.bigmodel.cn`
 
-用量查询只访问所选区域的 `/api/monitor/usage/quota/limit`，`Authorization` 使用原始 API Key，不添加 `Bearer`。
+当前额度查询访问所选区域的 `/api/monitor/usage/quota/limit`，30 天 Token 活动查询访问 `/api/monitor/usage/model-usage`；后者的小时桶会在 daemon 上按自然日汇总。`Authorization` 使用原始 API Key，不添加 `Bearer`。
 
 ### Kimi Coding
 
 用量查询访问 `https://api.kimi.com/coding/v1/usages`，使用 `Bearer` API Key 和 Kimi CLI User-Agent。
+
+Kimi 没有可用的账号级历史接口。管理界面打开期间仍每 60 秒查询一次当前额度，但 `usage-cache.json` 每 5 分钟至多追加一个快照并只保留最近 7 天；关闭界面期间插件不会为了补齐历史而主动请求。窗口的 `resetTime` 变化或已用百分比下降会被记录为重置，界面中的“本周期增量”会从该点重新计算。这些值是套餐配额百分比，不会被标成 Token。
+
+### Token 活动与配额
+
+Codex 当前额度仍来自 `/backend-api/wham/usage`；按日 Token 活动来自 `/backend-api/wham/profiles/me`。Token 数与套餐额度消耗不是线性关系，因此界面把“Token 活动”和当前额度进度条分区展示。历史请求失败时会继续显示上次成功的历史并标记为缓存，不影响当前额度刷新。
 
 ## 用量查询网络代理
 
@@ -136,7 +143,7 @@ $PASEO_HOME/coding-plan-manager
 
 ```text
 plans.json          # 不含明文凭据的 Plan 元数据
-usage-cache.json    # 最近一次成功用量
+usage-cache.json    # 最近一次成功用量、服务端 Token 活动和 Kimi 本地快照
 secrets/<plan>.json # OAuth / API Key
 ```
 
@@ -155,7 +162,8 @@ secrets/<plan>.json # OAuth / API Key
 三个用量接口都属于产品内部接口，不是稳定的公共计费 API，供应商可能随时修改路径或响应字段：
 
 - Codex：`https://chatgpt.com/backend-api/wham/usage`
-- 智谱：`https://<region>/api/monitor/usage/quota/limit`
+- Codex 历史：`https://chatgpt.com/backend-api/wham/profiles/me`
+- 智谱：`https://<region>/api/monitor/usage/quota/limit`、`/api/monitor/usage/model-usage`
 - Kimi：`https://api.kimi.com/coding/v1/usages`
 
 解析器保留未知窗口，并兼容当前常见 snake_case / camelCase reset 字段；接口变更时请先查看 Paseo 插件日志。
@@ -167,7 +175,7 @@ npm run typecheck
 npm test
 ```
 
-测试覆盖三个用量响应和多模型列表的归一化、OpenCode JSONC 多模型目录、Codex TOML/模型 metadata 以及 Claude Code 环境和 model picker 投影。
+测试覆盖三个当前用量响应、Codex/智谱历史归一化、Kimi 快照节流与重置、多模型列表、OpenCode JSONC 多模型目录、Codex TOML/模型 metadata 以及 Claude Code 环境和 model picker 投影。
 
 ## 参考实现
 
