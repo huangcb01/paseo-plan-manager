@@ -181,9 +181,14 @@ function usageDetail(window: UsageWindow): string {
 }
 
 function compactNumber(value: number): string {
-  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(value >= 10_000_000_000 ? 0 : 1)}B`;
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}K`;
+  const scaled = (divisor: number, suffix: string) => {
+    const amount = value / divisor;
+    const digits = amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+    return `${Number(amount.toFixed(digits))}${suffix}`;
+  };
+  if (value >= 1_000_000_000) return scaled(1_000_000_000, "B");
+  if (value >= 1_000_000) return scaled(1_000_000, "M");
+  if (value >= 1_000) return scaled(1_000, "k");
   return Math.round(value).toLocaleString();
 }
 
@@ -391,6 +396,12 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       alignItems: "center",
       justifyContent: "space-between",
       gap: 12,
+    },
+    sectionTitleRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: 7,
     },
     sectionTitle: {
       color: theme.colors.foreground,
@@ -647,6 +658,25 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       height: 1,
       backgroundColor: theme.colors.foregroundMuted,
       opacity: 0.25,
+    },
+    historyTooltip: {
+      position: "absolute",
+      top: 3,
+      left: 3,
+      right: 3,
+      zIndex: 2,
+      borderWidth: 1,
+      borderColor: theme.colors.accent,
+      backgroundColor: theme.colors.surface0,
+      paddingHorizontal: 5,
+      paddingVertical: 3,
+    },
+    historyTooltipText: {
+      color: theme.colors.foreground,
+      fontSize: 9,
+      lineHeight: 12,
+      fontWeight: "700",
+      textAlign: "center",
     },
     historyBars: {
       flex: 1,
@@ -1181,10 +1211,12 @@ interface HistoryBarValue {
 function HistoryBars({
   values,
   maxValue,
+  onActiveChange,
   styles,
 }: {
   values: HistoryBarValue[];
   maxValue: number;
+  onActiveChange: (value?: HistoryBarValue) => void;
   styles: Styles;
 }) {
   return (
@@ -1194,10 +1226,15 @@ function HistoryBars({
           ? `${Math.max(4, Math.min(100, (value.value / maxValue) * 100))}%` as `${number}%`
           : 1;
         return (
-          <View
+          <Pressable
             key={value.key}
             accessible
+            accessibilityRole="image"
             accessibilityLabel={value.label}
+            onHoverIn={() => onActiveChange(value)}
+            onHoverOut={() => onActiveChange(undefined)}
+            onFocus={() => onActiveChange(value)}
+            onBlur={() => onActiveChange(undefined)}
             style={styles.historyBarSlot}
           >
             <View
@@ -1208,7 +1245,7 @@ function HistoryBars({
                 { height },
               ]}
             />
-          </View>
+          </Pressable>
         );
       })}
     </View>
@@ -1228,6 +1265,7 @@ function HistoryChart({
   formatY: (value: number) => string;
   styles: Styles;
 }) {
+  const [active, setActive] = useState<HistoryBarValue | undefined>();
   const yTicks = [maxValue, maxValue / 2, 0];
   const xTicks = axisIndexes(values.length, xTickCount).map((index) => values[index]);
   return (
@@ -1242,7 +1280,17 @@ function HistoryChart({
           <View pointerEvents="none" style={styles.historyGrid}>
             {[0, 1, 2].map((line) => <View key={line} style={styles.historyGridLine} />)}
           </View>
-          <HistoryBars values={values} maxValue={maxValue} styles={styles} />
+          <HistoryBars
+            values={values}
+            maxValue={maxValue}
+            onActiveChange={setActive}
+            styles={styles}
+          />
+          {active ? (
+            <View pointerEvents="none" style={styles.historyTooltip}>
+              <Text style={styles.historyTooltipText}>{active.label}</Text>
+            </View>
+          ) : null}
         </View>
       </View>
       <View style={styles.historyAxis}>
@@ -1313,7 +1361,7 @@ function TokenActivityHistory({
               key: point.date,
               value: point.tokens,
               axisLabel: shortDate(point.date),
-              label: `${point.date}：${point.tokens.toLocaleString()} tokens${point.calls === undefined ? "" : `，${point.calls.toLocaleString()} 次调用`}`,
+              label: `${point.date}：${compactNumber(point.tokens)} tokens${point.calls === undefined ? "" : `，${compactNumber(point.calls)} 次调用`}`,
             }))}
             maxValue={maxTokens}
             xTickCount={days === 7 ? 4 : 5}
@@ -1340,6 +1388,7 @@ function LocalQuotaHistory({
   currentWindows: UsageWindow[];
   styles: Styles;
 }) {
+  const [selectedWindowId, setSelectedWindowId] = useState<string>();
   const latestWindows = history?.points[history.points.length - 1]?.windows ?? [];
   const candidates = (currentWindows.length ? currentWindows : latestWindows)
     .filter((window) => window.usedPercent !== undefined)
@@ -1363,6 +1412,7 @@ function LocalQuotaHistory({
         return series.length ? [{ window, series }] : [];
       })
     : [];
+  const selectedHistory = historySeries.find(({ window }) => window.id === selectedWindowId) ?? historySeries[0];
   return (
     <View style={styles.historySection}>
       <View style={styles.historyHeader}>
@@ -1370,11 +1420,35 @@ function LocalQuotaHistory({
           <Text style={styles.historyTitle}>配额变化</Text>
           <Text style={styles.historySource}>本机 · 5 分钟</Text>
         </View>
-        <Text style={styles.historyAxisText}>保留 7 天</Text>
+        {historySeries.length > 1 && selectedHistory ? (
+          <View style={styles.historyRange}>
+            {historySeries.map(({ window }) => {
+              const selected = selectedHistory.window.id === window.id;
+              return (
+                <Pressable
+                  key={window.id}
+                  accessibilityRole="button"
+                  accessibilityLabel={`显示 ${window.label} 配额变化`}
+                  accessibilityState={{ selected }}
+                  onPress={() => setSelectedWindowId(window.id)}
+                  style={({ pressed }) => [
+                    styles.historyRangeButton,
+                    selected && styles.historyRangeButtonActive,
+                    pressed && styles.buttonPressed,
+                  ]}
+                >
+                  <Text style={[styles.historyRangeText, selected && styles.historyRangeTextActive]}>
+                    {window.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        ) : null}
       </View>
-      {historySeries.length ? (
+      {selectedHistory ? (
         <View style={styles.quotaHistoryList}>
-          {historySeries.map(({ window, series }) => {
+            {[selectedHistory].map(({ window, series }) => {
             let cycleStart = 0;
             for (let index = series.length - 1; index >= 0; index -= 1) {
               if (series[index].reset) {
@@ -1415,12 +1489,11 @@ function LocalQuotaHistory({
                 />
               </View>
             );
-          })}
+            })}
         </View>
       ) : (
         <Text style={styles.muted}>首次成功刷新后开始记录；每 5 分钟至多保存一个快照。</Text>
       )}
-      <Text style={styles.muted}>这里记录套餐配额百分比，不是 Token 数量；关闭面板期间不会主动请求。</Text>
     </View>
   );
 }
@@ -2170,7 +2243,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
         ) : null}
 
         <View style={styles.sectionHeader}>
-          <View>
+          <View style={styles.sectionTitleRow}>
             <Text style={styles.sectionTitle}>额度总览</Text>
             <Text style={styles.sectionMeta}>
               {usageQuery.dataUpdatedAt
