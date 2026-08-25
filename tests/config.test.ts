@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { parse } from "jsonc-parser";
 import {
+  codexModelCatalog,
   patchClaudeSettings,
   patchClaudeState,
   patchCodexConfig,
@@ -28,7 +29,7 @@ function plan(provider: Plan["provider"]): Plan {
   };
 }
 
-test("patches one OpenCode provider while preserving comments and unrelated providers", () => {
+test("patches one multi-model OpenCode provider while preserving comments and unrelated providers", () => {
   const source = `{
   // keep this comment
   "theme": "system",
@@ -37,7 +38,11 @@ test("patches one OpenCode provider while preserving comments and unrelated prov
     "kimi": { "old": true }
   }
 }\n`;
-  const output = patchOpenCodeConfig(source, plan("kimi"), "kimi-for-coding");
+  const output = patchOpenCodeConfig(source, plan("kimi"), [
+    " kimi-for-coding ",
+    "kimi-latest",
+    "kimi-for-coding",
+  ]);
   const parsed = parse(output) as Record<string, any>;
 
   assert.match(output, /keep this comment/);
@@ -46,7 +51,27 @@ test("patches one OpenCode provider while preserving comments and unrelated prov
   assert.equal(parsed.provider.kimi.npm, "@ai-sdk/anthropic");
   assert.equal(parsed.provider.kimi.options.baseURL, "https://api.kimi.com/coding/v1");
   assert.equal(parsed.provider.kimi.options.apiKey, undefined);
+  assert.deepEqual(parsed.provider.kimi.models, {
+    "kimi-for-coding": { name: "kimi-for-coding" },
+    "kimi-latest": { name: "kimi-latest" },
+  });
   assert.equal(parsed.model, "kimi/kimi-for-coding");
+});
+
+test("leaves the OpenCode built-in OpenAI catalog untouched for Codex OAuth", () => {
+  const source = '{"provider":{"openai":{"models":{"official":{"name":"Official"}}}}}';
+  const parsed = JSON.parse(patchOpenCodeConfig(source, plan("codex"), ["gpt-default", "gpt-extra"]));
+  assert.equal(parsed.model, "openai/gpt-default");
+  assert.deepEqual(parsed.provider.openai.models, { official: { name: "Official" } });
+});
+
+test("rejects invalid model lists from direct apply callers", async () => {
+  await assert.rejects(applyPlanToTarget("unused", "opencode", []), /at least one model/);
+  await assert.rejects(
+    applyPlanToTarget("unused", "opencode", Array.from({ length: 17 }, () => "duplicate")),
+    /more than 16 models/,
+  );
+  await assert.rejects(applyPlanToTarget("unused", "opencode", ["x".repeat(257)]), /256 characters/);
 });
 
 test("patches OpenCode auth without deleting another provider", () => {
@@ -96,7 +121,7 @@ base_url = "https://old.example"
   const output = patchCodexConfig(
     source,
     { ...plan("zhipu"), region: "global" },
-    "glm-5.2",
+    ["glm-5.2", "glm-5.3"],
     { apiKey: "zai-secret", modelCatalogPath: "/tmp/models.json" },
   );
   assert.match(output, /# user comment/);
@@ -110,12 +135,30 @@ base_url = "https://old.example"
   assert.equal((output.match(/BEGIN paseo-coding-plan-manager/g) ?? []).length, 1);
 });
 
+test("writes every selected Zhipu model with its Codex catalog metadata", () => {
+  const catalog = JSON.parse(codexModelCatalog(["glm-5.3", "glm-5.2", "glm-5.3"]));
+  assert.deepEqual(catalog.models.map((model: Record<string, unknown>) => model.slug), ["glm-5.3", "glm-5.2"]);
+  assert.equal(catalog.models[0].context_window, 1_048_576);
+  assert.equal(catalog.models[1].context_window, 204_800);
+});
+
 test("patches only Claude env and keeps unrelated settings", () => {
   const source = JSON.stringify({
     permissions: { allow: ["Bash(git:*)"] },
     env: { KEEP_ME: "yes", ANTHROPIC_API_KEY: "old" },
+    modelPicker: {
+      replaceBuiltInOptions: true,
+      options: [
+        { model: "existing-model", label: "Existing", description: "Keep this row" },
+        { model: "kimi-for-coding", label: "User label" },
+      ],
+    },
   });
-  const output = patchClaudeSettings(source, plan("kimi"), "kimi-secret", "kimi-for-coding");
+  const output = patchClaudeSettings(source, plan("kimi"), "kimi-secret", [
+    "kimi-for-coding",
+    "kimi-latest",
+    "kimi-latest",
+  ]);
   const parsed = JSON.parse(output);
   assert.deepEqual(parsed.permissions, { allow: ["Bash(git:*)"] });
   assert.equal(parsed.env.KEEP_ME, "yes");
@@ -125,22 +168,46 @@ test("patches only Claude env and keeps unrelated settings", () => {
   assert.equal(parsed.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "kimi-for-coding");
   assert.equal(parsed.env.CLAUDE_CODE_SUBAGENT_MODEL, "kimi-for-coding");
   assert.equal(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "262144");
+  assert.equal(parsed.modelPicker.replaceBuiltInOptions, true);
+  assert.deepEqual(parsed.modelPicker.options, [
+    { model: "existing-model", label: "Existing", description: "Keep this row" },
+    { model: "kimi-for-coding", label: "User label" },
+    { model: "kimi-latest", label: "kimi-latest" },
+  ]);
+});
+
+test("uses the 1M Kimi context only when every selected model supports it", () => {
+  const allLarge = JSON.parse(patchClaudeSettings(undefined, plan("kimi"), "secret", ["k3", "k3[1m]"]));
+  const mixed = JSON.parse(patchClaudeSettings(undefined, plan("kimi"), "secret", ["k3", "kimi-for-coding"]));
+  assert.equal(allLarge.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1048576");
+  assert.equal(mixed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "262144");
+});
+
+test("fails closed for incompatible Claude model picker settings", () => {
+  assert.throws(
+    () => patchClaudeSettings('{"modelPicker":[]}', plan("kimi"), "secret", ["kimi-for-coding"]),
+    /modelPicker must be an object/,
+  );
+  assert.throws(
+    () => patchClaudeSettings('{"modelPicker":{"options":{}}}', plan("kimi"), "secret", ["kimi-for-coding"]),
+    /modelPicker\.options must be an array/,
+  );
 });
 
 test("refuses Chat-only Coding Plans in a direct Codex projection", () => {
   assert.throws(
-    () => patchCodexConfig(undefined, plan("kimi"), "kimi-for-coding", { apiKey: "secret", modelCatalogPath: "/tmp/models.json" }),
+    () => patchCodexConfig(undefined, plan("kimi"), ["kimi-for-coding"], { apiKey: "secret", modelCatalogPath: "/tmp/models.json" }),
     /conversion proxy/,
   );
   assert.throws(
-    () => patchCodexConfig(undefined, { ...plan("zhipu"), region: "cn-dev" }, "glm-5.2", { apiKey: "secret", modelCatalogPath: "/tmp/models.json" }),
+    () => patchCodexConfig(undefined, { ...plan("zhipu"), region: "cn-dev" }, ["glm-5.2"], { apiKey: "secret", modelCatalogPath: "/tmp/models.json" }),
     /conversion proxy/,
   );
 });
 
 test("refuses a direct Codex OAuth projection to Claude Code", () => {
   assert.throws(
-    () => patchClaudeSettings(undefined, plan("codex"), "unused", "gpt-5.6-sol"),
+    () => patchClaudeSettings(undefined, plan("codex"), "unused", ["gpt-5.6-sol"]),
     /protocol-conversion proxy/,
   );
 });
@@ -169,7 +236,7 @@ test("writes Claude onboarding state inside a custom CLAUDE_CONFIG_DIR profile",
       provider: "kimi",
       apiKey: "kimi-secret",
     });
-    const result = await applyPlanToTarget(saved.id, "claude", "kimi-custom-model", store);
+    const result = await applyPlanToTarget(saved.id, "claude", ["kimi-custom-model", "kimi-backup-model"], store);
     assert.equal(result.applied, true);
     assert.ok(result.configPaths.includes(statePath));
     const state = JSON.parse(await readFile(statePath, "utf8"));
@@ -179,6 +246,11 @@ test("writes Claude onboarding state inside a custom CLAUDE_CONFIG_DIR profile",
     const settings = JSON.parse(await readFile(path.join(profile, "settings.json"), "utf8"));
     assert.equal(settings.env.ANTHROPIC_API_KEY, "kimi-secret");
     assert.equal(settings.env.ANTHROPIC_MODEL, "kimi-custom-model");
+    assert.deepEqual(settings.modelPicker.options, [
+      { model: "kimi-custom-model", label: "kimi-custom-model" },
+      { model: "kimi-backup-model", label: "kimi-backup-model" },
+    ]);
+    assert.ok(result.warnings.some((warning) => warning.includes("2.1.242")));
   } finally {
     if (previousClaudeConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfig;
@@ -188,11 +260,11 @@ test("writes Claude onboarding state inside a custom CLAUDE_CONFIG_DIR profile",
 
 test("removes the managed bearer token when switching Codex back to OAuth", () => {
   const globalPlan = { ...plan("zhipu"), region: "global" as const };
-  const thirdParty = patchCodexConfig(undefined, globalPlan, "glm-5.2", {
+  const thirdParty = patchCodexConfig(undefined, globalPlan, ["glm-5.2"], {
     apiKey: "secret",
     modelCatalogPath: "/tmp/models.json",
   });
-  const official = patchCodexConfig(thirdParty, plan("codex"), "gpt-5.6-sol");
+  const official = patchCodexConfig(thirdParty, plan("codex"), ["gpt-5.6-sol"]);
   assert.doesNotMatch(official, /secret|experimental_bearer_token|model_catalog_json/);
   assert.match(official, /model_provider = "openai"/);
 });
@@ -208,7 +280,7 @@ test("does not write Chat-only Codex config and keeps Z.AI keys out of auth.json
       provider: "kimi",
       apiKey: "kimi-secret",
     });
-    const refused = await applyPlanToTarget(kimi.id, "codex", "kimi-for-coding", store);
+    const refused = await applyPlanToTarget(kimi.id, "codex", ["kimi-for-coding"], store);
     assert.equal(refused.applied, false);
     await assert.rejects(stat(path.join(root, "codex", "config.toml")), { code: "ENOENT" });
 
@@ -218,12 +290,14 @@ test("does not write Chat-only Codex config and keeps Z.AI keys out of auth.json
       region: "global",
       apiKey: "zai-secret",
     });
-    const applied = await applyPlanToTarget(zai.id, "codex", "glm-custom-model", store);
+    const applied = await applyPlanToTarget(zai.id, "codex", ["glm-custom-model", "glm-5.3"], store);
     assert.equal(applied.applied, true);
     const config = await readFile(path.join(root, "codex", "config.toml"), "utf8");
     assert.match(config, /model = "glm-custom-model"/);
     assert.match(config, /https:\/\/api\.z\.ai\/api\/v1/);
     assert.match(config, /experimental_bearer_token = "zai-secret"/);
+    const catalog = JSON.parse(await readFile(path.join(root, "codex", "paseo-coding-plan-models.json"), "utf8"));
+    assert.deepEqual(catalog.models.map((model: Record<string, unknown>) => model.slug), ["glm-custom-model", "glm-5.3"]);
     await assert.rejects(stat(path.join(root, "codex", "auth.json")), { code: "ENOENT" });
   } finally {
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -254,7 +328,7 @@ test("refuses to overwrite Codex OAuth when a quoted TOML key selects keyring", 
     });
     await mkdir(process.env.CODEX_HOME, { recursive: true });
     await writeFile(path.join(process.env.CODEX_HOME, "config.toml"), '"cli_auth_credentials_store" = "keyring"\n');
-    const result = await applyPlanToTarget(codexPlan.id, "codex", "gpt-5.6-sol", store);
+    const result = await applyPlanToTarget(codexPlan.id, "codex", ["gpt-5.6-sol"], store);
     assert.equal(result.applied, false);
     assert.match(result.message, /keyring/);
     await assert.rejects(stat(path.join(process.env.CODEX_HOME, "auth.json")), { code: "ENOENT" });
@@ -468,7 +542,7 @@ test("keeps large direct Codex auth content readable", async () => {
 
 test("fails closed instead of duplicating quoted Codex root keys", () => {
   assert.throws(
-    () => patchCodexConfig('"model" = "user-model"\n', plan("codex"), "gpt-5.6-sol"),
+    () => patchCodexConfig('"model" = "user-model"\n', plan("codex"), ["gpt-5.6-sol"]),
     /not valid TOML/,
   );
 });
@@ -477,7 +551,7 @@ test("does not treat marker text inside a TOML value as a managed block", () => 
   const output = patchCodexConfig(
     'note = "# BEGIN paseo-coding-plan-manager"\n',
     plan("codex"),
-    "gpt-5.6-sol",
+    ["gpt-5.6-sol"],
   );
   assert.match(output, /note = "# BEGIN paseo-coding-plan-manager"/);
   assert.match(output, /model_provider = "openai"/);
@@ -488,7 +562,7 @@ test("fails closed for multiline TOML strings", () => {
     () => patchCodexConfig(
       'note = """\nmodel = "not a root key"\n"""\n',
       plan("codex"),
-      "gpt-5.6-sol",
+      ["gpt-5.6-sol"],
     ),
     /multiline TOML strings/,
   );
@@ -498,7 +572,7 @@ test("uses the official mainland GLM Responses endpoint for Codex", () => {
   const output = patchCodexConfig(
     undefined,
     { ...plan("zhipu"), region: "cn" },
-    "glm-5.3",
+    ["glm-5.3"],
     { apiKey: "cn-secret", modelCatalogPath: "/tmp/models.json" },
   );
   assert.match(output, /base_url = "https:\/\/open\.bigmodel\.cn\/api\/v1"/);
@@ -543,7 +617,7 @@ test("preserves a newer same-identity OpenCode OAuth generation", async () => {
       provider: "codex",
       authFilePath: sourceAuth,
     });
-    const result = await applyPlanToTarget(saved.id, "opencode", "custom-openai-model", store);
+    const result = await applyPlanToTarget(saved.id, "opencode", ["custom-openai-model", "unused-catalog-model"], store);
     assert.equal(result.applied, true);
     const config = JSON.parse(
       await readFile(path.join(root, "config", "opencode", "opencode.json"), "utf8"),

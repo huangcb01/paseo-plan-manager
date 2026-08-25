@@ -384,6 +384,31 @@ function kimiReset(value: unknown, detail: Record<string, unknown>): string | un
   return relative === undefined ? undefined : new Date(Date.now() + relative * 1000).toISOString();
 }
 
+function kimiWindowLabel(duration: number | undefined, unit: string | undefined, fallback: string): string {
+  if (!duration || !unit) return fallback;
+  const normalizedUnit = unit.replace(/^TIME_UNIT_/i, "").toLowerCase();
+  if (normalizedUnit.startsWith("minute")) {
+    return duration % 60 === 0 ? `${duration / 60} 小时` : `${duration} 分钟`;
+  }
+  if (normalizedUnit.startsWith("hour")) return `${duration} 小时`;
+  if (normalizedUnit.startsWith("day")) return `${duration} 天`;
+  if (normalizedUnit.startsWith("week")) return duration === 1 ? "每周" : `${duration} 周`;
+  return fallback;
+}
+
+function kimiUsedPercent(
+  used: string | undefined,
+  remaining: string | undefined,
+  limit: string | undefined,
+): number | undefined {
+  const explicit = percentFrom(used, limit);
+  if (explicit !== undefined) return explicit;
+  const remainingNumber = numberValue(remaining);
+  const limitNumber = numberValue(limit);
+  if (remainingNumber === undefined || limitNumber === undefined || limitNumber <= 0) return undefined;
+  return clampPercent(((limitNumber - remainingNumber) / limitNumber) * 100);
+}
+
 function kimiWindow(raw: unknown, id: string, fallbackLabel: string): UsageWindow | undefined {
   if (!isObject(raw)) return undefined;
   const detail = isObject(raw.detail) ? raw.detail : raw;
@@ -394,14 +419,15 @@ function kimiWindow(raw: unknown, id: string, fallbackLabel: string): UsageWindo
   const windowInfo = isObject(raw.window) ? raw.window : undefined;
   const duration = windowInfo ? numberValue(windowInfo.duration) : undefined;
   const unit = windowInfo ? stringValue(valueAt(windowInfo, "timeUnit", "time_unit")) : undefined;
-  const label = duration && unit ? `${duration} ${unit}` : fallbackLabel;
+  const label = kimiWindowLabel(duration, unit, fallbackLabel);
+  const usedPercent = kimiUsedPercent(used, remaining, limit);
   return {
     id,
     label,
     ...(used ? { used } : {}),
     ...(limit ? { limit } : {}),
     ...(remaining ? { remaining } : {}),
-    ...(percentFrom(used, limit) !== undefined ? { usedPercent: percentFrom(used, limit) } : {}),
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
     ...(resetAt ? { resetAt } : {}),
   };
 }
@@ -415,14 +441,14 @@ export function normalizeKimiUsage(raw: unknown, planId: string): UsageSnapshot 
     throw new Error("Kimi usage response does not contain quota data");
   }
   const windows: UsageWindow[] = [];
-  const weekly = kimiWindow(raw.usage, "weekly", "每周");
-  if (weekly) windows.push(weekly);
   if (Array.isArray(raw.limits)) {
     raw.limits.forEach((entry, index) => {
       const window = kimiWindow(entry, `window-${index}`, `限流窗口 ${index + 1}`);
       if (window) windows.push(window);
     });
   }
+  const weekly = kimiWindow(raw.usage, "weekly", "每周");
+  if (weekly) windows.push(weekly);
   const parallel = isObject(raw.parallel) ? stringValue(raw.parallel.limit) : undefined;
   return {
     planId,

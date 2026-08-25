@@ -130,8 +130,8 @@ test("normalizes Kimi weekly and all rate windows", () => {
       },
       limits: [
         {
-          window: { duration: 5, timeUnit: "hours" },
-          detail: { used: "20", limit: "100", resetTime: "2027-01-01T01:00:00Z" },
+          window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
+          detail: { remaining: "80", limit: "100", resetTime: "2027-01-01T01:00:00Z" },
         },
         {
           window: { duration: 1, timeUnit: "minute" },
@@ -145,10 +145,11 @@ test("normalizes Kimi weekly and all rate windows", () => {
 
   assert.equal(result.parallelLimit, "4");
   assert.equal(result.windows.length, 3);
-  assert.equal(result.windows[0].usedPercent, 25);
-  assert.equal(result.windows[0].resetAt, "2027-01-01T00:00:00.123Z");
-  assert.equal(result.windows[1].label, "5 hours");
-  assert.equal(result.windows[2].usedPercent, 30);
+  assert.deepEqual(result.windows.map((window) => window.label), ["5 小时", "1 分钟", "每周"]);
+  assert.equal(result.windows[0].usedPercent, 20);
+  assert.equal(result.windows[1].usedPercent, 30);
+  assert.equal(result.windows[2].usedPercent, 25);
+  assert.equal(result.windows[2].resetAt, "2027-01-01T00:00:00.123Z");
 });
 
 test("rejects failed GLM envelopes", () => {

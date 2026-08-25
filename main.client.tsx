@@ -16,6 +16,7 @@ import {
   getDashboard,
   refreshUsage,
   savePlan,
+  type ApplyPlanInput,
   type ApplyPlanResult,
   type CodexAuthMode,
   type Dashboard,
@@ -44,7 +45,9 @@ interface EditorState {
 interface ApplyDraft {
   planId: string;
   target: Target;
-  model: string;
+  models: string[];
+  customModel: string;
+  pickerOpen: boolean;
 }
 
 interface NoticeState {
@@ -54,7 +57,7 @@ interface NoticeState {
 }
 
 const PROVIDER_LABELS: Record<Provider, string> = {
-  codex: "Codex / ChatGPT",
+  codex: "ChatGPT",
   zhipu: "智谱 GLM",
   kimi: "Kimi Coding",
 };
@@ -75,6 +78,20 @@ function defaultModelFor(provider: Provider, target: Target): string {
   if (provider === "codex") return "gpt-5.6-sol";
   if (provider === "zhipu") return target === "codex" ? "glm-5.3" : "glm-5.1";
   return "kimi-for-coding";
+}
+
+function modelCandidatesFor(provider: Provider, target: Target): readonly string[] {
+  if (provider === "codex") {
+    return ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.3-codex-spark"];
+  }
+  if (provider === "zhipu") {
+    if (target === "codex") return ["glm-5.3", "glm-5-turbo", "glm-4.7"];
+    if (target === "claude") return ["glm-5.1", "glm-5.3", "glm-5.3[1m]", "glm-5-turbo", "glm-4.7"];
+    return ["glm-5.1", "glm-5.3", "glm-5-turbo", "glm-4.7"];
+  }
+  return target === "claude"
+    ? ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3[1m]", "k3-256k"]
+    : ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k"];
 }
 
 function emptyEditor(provider: Provider, dashboard?: Dashboard): EditorState {
@@ -193,13 +210,6 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       fontWeight: "800",
       letterSpacing: -1.2,
     },
-    subtitle: {
-      color: theme.colors.foregroundMuted,
-      fontSize: 13,
-      marginTop: 5,
-      maxWidth: 680,
-      lineHeight: 19,
-    },
     row: {
       flexDirection: "row",
       alignItems: "center",
@@ -215,11 +225,13 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       gap: 8,
     },
     button: {
-      minHeight: 44,
+      minHeight: 32,
+      maxWidth: "100%",
+      alignSelf: "flex-start",
       borderWidth: 1,
       borderColor: theme.colors.foregroundMuted,
-      paddingHorizontal: 13,
-      paddingVertical: 8,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
       justifyContent: "center",
       alignItems: "center",
     },
@@ -240,6 +252,7 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       color: theme.colors.foreground,
       fontSize: 12,
       fontWeight: "700",
+      textAlign: "center",
     },
     buttonTextPrimary: {
       color: theme.colors.accentForeground,
@@ -253,8 +266,11 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       gap: 8,
     },
     stat: {
-      minWidth: compact ? "47%" : 150,
+      minWidth: 80,
+      maxWidth: 200,
+      flexBasis: 80,
       flexGrow: 1,
+      flexShrink: 1,
       borderLeftWidth: 3,
       borderLeftColor: theme.colors.accent,
       paddingHorizontal: 12,
@@ -313,9 +329,11 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       gap: 12,
     },
     card: {
-      width: compact ? "100%" : "49%",
-      minWidth: compact ? 0 : 390,
+      minWidth: 250,
+      maxWidth: 620,
+      flexBasis: 250,
       flexGrow: 1,
+      flexShrink: 1,
       borderWidth: 1,
       borderColor: theme.colors.foregroundMuted,
       padding: compact ? 14 : 17,
@@ -343,16 +361,106 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     },
     cardHeading: {
       flex: 1,
+      minWidth: 0,
       gap: 2,
+    },
+    cardTitleRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: 7,
     },
     cardTitle: {
       color: theme.colors.foreground,
       fontSize: 16,
       fontWeight: "800",
     },
+    cardProvider: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 10,
+      fontWeight: "700",
+    },
     cardMeta: {
       color: theme.colors.foregroundMuted,
       fontSize: 11,
+    },
+    cardActions: {
+      flexDirection: "row",
+      alignItems: "center",
+      flexShrink: 0,
+      gap: 5,
+    },
+    iconButton: {
+      width: 28,
+      height: 28,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    pencilIcon: {
+      width: 16,
+      height: 16,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      transform: [{ rotate: "-45deg" }],
+    },
+    pencilEraser: {
+      width: 3,
+      height: 4,
+      backgroundColor: theme.colors.foregroundMuted,
+    },
+    pencilShaft: {
+      width: 9,
+      height: 4,
+      backgroundColor: theme.colors.foreground,
+    },
+    pencilTip: {
+      width: 0,
+      height: 0,
+      borderTopWidth: 2,
+      borderBottomWidth: 2,
+      borderLeftWidth: 3,
+      borderTopColor: "transparent",
+      borderBottomColor: "transparent",
+      borderLeftColor: theme.colors.foreground,
+    },
+    trashIcon: {
+      width: 14,
+      height: 16,
+      alignItems: "center",
+    },
+    trashHandle: {
+      width: 6,
+      height: 2,
+      backgroundColor: theme.colors.foreground,
+    },
+    trashLid: {
+      width: 13,
+      height: 2,
+      marginBottom: 2,
+      backgroundColor: theme.colors.foreground,
+    },
+    trashBody: {
+      width: 10,
+      height: 10,
+      borderLeftWidth: 1,
+      borderRightWidth: 1,
+      borderBottomWidth: 1,
+      borderColor: theme.colors.foreground,
+      flexDirection: "row",
+      justifyContent: "space-evenly",
+      paddingTop: 2,
+    },
+    trashSlot: {
+      width: 1,
+      height: 5,
+      backgroundColor: theme.colors.foregroundMuted,
+    },
+    iconFillDanger: {
+      backgroundColor: theme.colors.statusDanger,
+    },
+    iconBorderDanger: {
+      borderColor: theme.colors.statusDanger,
     },
     tier: {
       color: theme.colors.accent,
@@ -369,6 +477,9 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     },
     targetBadgeActive: {
       borderColor: theme.colors.accent,
+    },
+    targetBadgeDisabled: {
+      opacity: 0.45,
     },
     targetBadgeText: {
       color: theme.colors.foregroundMuted,
@@ -436,6 +547,100 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       paddingTop: 13,
       gap: 11,
     },
+    modelSelector: {
+      gap: 7,
+    },
+    modelSelectorTrigger: {
+      minHeight: 42,
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      paddingHorizontal: 10,
+      paddingVertical: 7,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 10,
+    },
+    modelSelectorSummary: {
+      flex: 1,
+      minWidth: 0,
+      gap: 2,
+    },
+    modelSelectorTitle: {
+      color: theme.colors.foreground,
+      fontSize: 12,
+      fontWeight: "800",
+    },
+    modelSelectorMeta: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 10,
+    },
+    modelSelectorToggle: {
+      color: theme.colors.accent,
+      fontSize: 10,
+      fontWeight: "800",
+    },
+    modelMenu: {
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      padding: 8,
+      gap: 7,
+    },
+    modelOption: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 7,
+    },
+    modelOptionToggle: {
+      flex: 1,
+      minWidth: 0,
+      minHeight: 30,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 7,
+    },
+    modelCheckbox: {
+      width: 17,
+      height: 17,
+      flexShrink: 0,
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    modelCheckboxSelected: {
+      backgroundColor: theme.colors.accent,
+      borderColor: theme.colors.accent,
+    },
+    modelCheckboxText: {
+      color: theme.colors.accentForeground,
+      fontSize: 10,
+      fontWeight: "900",
+    },
+    modelOptionLabel: {
+      flex: 1,
+      minWidth: 0,
+      color: theme.colors.foreground,
+      fontSize: 11,
+      fontWeight: "700",
+    },
+    modelDefault: {
+      color: theme.colors.accent,
+      fontSize: 9,
+      fontWeight: "900",
+      letterSpacing: 0.5,
+    },
+    modelDefaultAction: {
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      paddingHorizontal: 6,
+      paddingVertical: 3,
+    },
+    modelDefaultActionText: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 9,
+      fontWeight: "700",
+    },
     editorTitle: {
       color: theme.colors.foreground,
       fontSize: 17,
@@ -501,8 +706,8 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     providerOption: {
       borderWidth: 1,
       borderColor: theme.colors.foregroundMuted,
-      paddingHorizontal: 11,
-      paddingVertical: 8,
+      paddingHorizontal: 7,
+      paddingVertical: 4,
     },
     providerOptionSelected: {
       backgroundColor: theme.colors.accent,
@@ -531,6 +736,12 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     fieldWide: {
       width: compact ? "100%" : undefined,
       flexBasis: compact ? "auto" : "64%",
+    },
+    fieldConstrained: {
+      minWidth: 0,
+      width: "100%",
+      flexGrow: 0,
+      flexBasis: "auto",
     },
     fieldLabel: {
       color: theme.colors.foregroundMuted,
@@ -623,6 +834,54 @@ function Button({
   );
 }
 
+function CardIconButton({
+  kind,
+  label,
+  onPress,
+  styles,
+  danger = false,
+  disabled = false,
+}: {
+  kind: "edit" | "delete";
+  label: string;
+  onPress: () => void;
+  styles: Styles;
+  danger?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      disabled={disabled}
+      hitSlop={4}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.iconButton,
+        disabled && styles.buttonDisabled,
+        pressed && styles.buttonPressed,
+      ]}
+    >
+      {kind === "edit" ? (
+        <View style={styles.pencilIcon}>
+          <View style={styles.pencilEraser} />
+          <View style={styles.pencilShaft} />
+          <View style={styles.pencilTip} />
+        </View>
+      ) : (
+        <View style={styles.trashIcon}>
+          <View style={[styles.trashHandle, danger && styles.iconFillDanger]} />
+          <View style={[styles.trashLid, danger && styles.iconFillDanger]} />
+          <View style={[styles.trashBody, danger && styles.iconBorderDanger]}>
+            <View style={[styles.trashSlot, danger && styles.iconFillDanger]} />
+            <View style={[styles.trashSlot, danger && styles.iconFillDanger]} />
+          </View>
+        </View>
+      )}
+    </Pressable>
+  );
+}
+
 function Field({
   label,
   value,
@@ -634,6 +893,8 @@ function Field({
   wide = false,
   disabled = false,
   multiline = false,
+  constrained = false,
+  maxLength,
 }: {
   label: string;
   value: string;
@@ -645,9 +906,11 @@ function Field({
   wide?: boolean;
   disabled?: boolean;
   multiline?: boolean;
+  constrained?: boolean;
+  maxLength?: number;
 }) {
   return (
-    <View style={[styles.field, wide && styles.fieldWide]}>
+    <View style={[styles.field, wide && styles.fieldWide, constrained && styles.fieldConstrained]}>
       <Text style={styles.fieldLabel}>{label}</Text>
       <TextInput
         accessibilityLabel={label}
@@ -658,6 +921,7 @@ function Field({
         placeholderTextColor={placeholderColor}
         secureTextEntry={secure}
         editable={!disabled}
+        maxLength={maxLength}
         multiline={multiline}
         numberOfLines={multiline ? 10 : 1}
         textAlignVertical={multiline ? "top" : "center"}
@@ -699,7 +963,7 @@ function PlanCard({
   confirmDelete,
   placeholderColor,
   onRequestApply,
-  onChangeApplyModel,
+  onChangeApplyDraft,
   onConfirmApply,
   onCancelApply,
   onEdit,
@@ -715,7 +979,7 @@ function PlanCard({
   confirmDelete: boolean;
   placeholderColor: string;
   onRequestApply: (target: Target) => void;
-  onChangeApplyModel: (model: string) => void;
+  onChangeApplyDraft: (draft: ApplyDraft) => void;
   onConfirmApply: () => void;
   onCancelApply: () => void;
   onEdit: () => void;
@@ -724,6 +988,9 @@ function PlanCard({
   const activeTargets = (["opencode", "codex", "claude"] as const).filter(
     (target) => dashboard.activeTargets[target] === plan.id,
   );
+  const modelCandidates = applyDraft
+    ? [...new Set([...modelCandidatesFor(plan.provider, applyDraft.target), ...applyDraft.models])]
+    : [];
   return (
     <View style={styles.card}>
       <View style={styles.cardTop}>
@@ -731,24 +998,59 @@ function PlanCard({
           <Text style={styles.providerMarkText}>{PROVIDER_MARKS[plan.provider]}</Text>
         </View>
         <View style={styles.cardHeading}>
-          <Text style={styles.cardTitle}>{plan.label}</Text>
+          <View style={styles.cardTitleRow}>
+            <Text style={styles.cardTitle}>{plan.label}</Text>
+            <Text style={styles.cardProvider}>{PROVIDER_LABELS[plan.provider]}</Text>
+            {usage?.planTier ? <Text style={styles.tier}>{usage.planTier}</Text> : null}
+          </View>
           <Text style={styles.cardMeta}>
-            {PROVIDER_LABELS[plan.provider]} · {plan.credentialHint} · {plan.useProxy ? "PROXY" : "DIRECT"}
+            {plan.credentialHint} · {plan.useProxy ? "PROXY" : "DIRECT"}
           </Text>
-          {usage?.planTier ? <Text style={styles.tier}>{usage.planTier}</Text> : null}
         </View>
-        {usage?.stale ? <Text style={styles.cardMeta}>STALE</Text> : null}
+        <View style={styles.cardActions}>
+          {usage?.stale ? <Text style={styles.cardMeta}>STALE</Text> : null}
+          <CardIconButton
+            kind="edit"
+            label={`编辑 ${plan.label}`}
+            onPress={onEdit}
+            styles={styles}
+            disabled={actionsDisabled}
+          />
+          <CardIconButton
+            kind="delete"
+            label={confirmDelete ? `再次点击确认删除 ${plan.label}` : `删除 ${plan.label}`}
+            onPress={onDelete}
+            styles={styles}
+            danger={confirmDelete}
+            disabled={actionsDisabled}
+          />
+        </View>
       </View>
 
       <View style={styles.row}>
         {(["opencode", "codex", "claude"] as const).map((target) => {
           const active = activeTargets.includes(target);
+          const supported = isTargetSupported(plan, target);
           return (
-            <View key={target} style={[styles.targetBadge, active && styles.targetBadgeActive]}>
+            <Pressable
+              key={target}
+              accessibilityRole="button"
+              accessibilityState={{ selected: active, disabled: actionsDisabled || !supported }}
+              disabled={actionsDisabled || !supported}
+              onPress={() => onRequestApply(target)}
+              style={({ pressed }) => [
+                styles.targetBadge,
+                active && styles.targetBadgeActive,
+                !supported && styles.targetBadgeDisabled,
+                pressed && supported && styles.buttonPressed,
+              ]}
+            >
               <Text style={[styles.targetBadgeText, active && styles.targetBadgeTextActive]}>
-                {active ? "ACTIVE · " : ""}{TARGET_LABELS[target]}
+                {applying === target
+                  ? "接入中..."
+                  : `${active ? "ACTIVE · " : ""}${TARGET_LABELS[target]}${supported ? "" : "（需代理）"}`}
               </Text>
-            </View>
+            </Pressable>
           );
         })}
       </View>
@@ -764,41 +1066,114 @@ function PlanCard({
       {usage?.balance ? <Text style={styles.muted}>Credits 余额 {usage.balance}</Text> : null}
       {usage?.error ? <Text style={styles.error}>{usage.error}</Text> : null}
 
-      <View style={styles.row}>
-        {(["opencode", "codex", "claude"] as const).map((target) => {
-          const supported = isTargetSupported(plan, target);
-          return (
-            <Button
-              key={target}
-              label={applying === target
-                ? "写入中..."
-                : supported
-                  ? `配置到 ${TARGET_LABELS[target]}`
-                  : `${TARGET_LABELS[target]}（需代理）`}
-              onPress={() => onRequestApply(target)}
-              styles={styles}
-              primary={target === "opencode"}
-              disabled={actionsDisabled || !supported}
-            />
-          );
-        })}
-      </View>
       {applyDraft ? (
         <View style={styles.applyConfigurator}>
           <View>
-            <Text style={styles.sectionTitle}>配置到 {TARGET_LABELS[applyDraft.target]}</Text>
+            <Text style={styles.sectionTitle}>接入到 {TARGET_LABELS[applyDraft.target]}</Text>
             <Text style={styles.muted}>模型仅用于本次配置写入，不会保存到 Coding Plan。</Text>
           </View>
-          <Field
-            label="目标模型"
-            value={applyDraft.model}
-            onChangeText={onChangeApplyModel}
-            placeholder="输入目标工具支持的模型 ID"
-            styles={styles}
-            placeholderColor={placeholderColor}
-            wide
-            disabled={Boolean(applying)}
-          />
+          <View style={styles.modelSelector}>
+            <Text style={styles.fieldLabel}>候选模型</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ expanded: applyDraft.pickerOpen, disabled: Boolean(applying) }}
+              aria-expanded={applyDraft.pickerOpen}
+              disabled={Boolean(applying)}
+              onPress={() => onChangeApplyDraft({ ...applyDraft, pickerOpen: !applyDraft.pickerOpen })}
+              style={({ pressed }) => [styles.modelSelectorTrigger, pressed && styles.buttonPressed]}
+            >
+              <View style={styles.modelSelectorSummary}>
+                <Text style={styles.modelSelectorTitle}>
+                  {applyDraft.models.length ? `已选择 ${applyDraft.models.length} 个模型` : "尚未选择模型"}
+                </Text>
+                <Text style={styles.modelSelectorMeta} numberOfLines={1}>
+                  {applyDraft.models.length ? `默认：${applyDraft.models[0]}` : "展开并勾选至少一个模型"}
+                </Text>
+              </View>
+              <Text style={styles.modelSelectorToggle}>{applyDraft.pickerOpen ? "收起" : "展开"}</Text>
+            </Pressable>
+            {applyDraft.pickerOpen ? (
+              <View style={styles.modelMenu}>
+                {modelCandidates.map((model) => {
+                  const selectedIndex = applyDraft.models.indexOf(model);
+                  const selected = selectedIndex >= 0;
+                  const selectionDisabled = Boolean(applying) || (!selected && applyDraft.models.length >= 16);
+                  return (
+                    <View key={model} style={styles.modelOption}>
+                      <Pressable
+                        accessibilityRole="checkbox"
+                        accessibilityState={{ checked: selected, disabled: selectionDisabled }}
+                        aria-checked={selected}
+                        disabled={selectionDisabled}
+                        onPress={() => {
+                          const models = selected
+                            ? applyDraft.models.filter((candidate) => candidate !== model)
+                            : [...applyDraft.models, model];
+                          onChangeApplyDraft({ ...applyDraft, models });
+                        }}
+                        style={({ pressed }) => [
+                          styles.modelOptionToggle,
+                          selectionDisabled && styles.buttonDisabled,
+                          pressed && !selectionDisabled && styles.buttonPressed,
+                        ]}
+                      >
+                        <View style={[styles.modelCheckbox, selected && styles.modelCheckboxSelected]}>
+                          {selected ? <Text style={styles.modelCheckboxText}>✓</Text> : null}
+                        </View>
+                        <Text style={styles.modelOptionLabel}>{model}</Text>
+                        {selectedIndex === 0 ? <Text style={styles.modelDefault}>默认</Text> : null}
+                      </Pressable>
+                      {selectedIndex > 0 ? (
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={`将 ${model} 设为默认模型`}
+                          disabled={Boolean(applying)}
+                          onPress={() => onChangeApplyDraft({
+                            ...applyDraft,
+                            models: [model, ...applyDraft.models.filter((candidate) => candidate !== model)],
+                          })}
+                          style={({ pressed }) => [styles.modelDefaultAction, pressed && styles.buttonPressed]}
+                        >
+                          <Text style={styles.modelDefaultActionText}>设为默认</Text>
+                        </Pressable>
+                      ) : null}
+                    </View>
+                  );
+                })}
+                <Field
+                  label="添加自定义模型 ID"
+                  value={applyDraft.customModel}
+                  onChangeText={(customModel) => onChangeApplyDraft({ ...applyDraft, customModel })}
+                  placeholder="输入候选列表之外的模型 ID"
+                  styles={styles}
+                  placeholderColor={placeholderColor}
+                  wide
+                  constrained
+                  maxLength={256}
+                  disabled={Boolean(applying)}
+                />
+                <Button
+                  label="添加模型"
+                  onPress={() => {
+                    const model = applyDraft.customModel.trim();
+                    if (!model || applyDraft.models.includes(model) || applyDraft.models.length >= 16) return;
+                    onChangeApplyDraft({ ...applyDraft, models: [...applyDraft.models, model], customModel: "" });
+                  }}
+                  styles={styles}
+                  disabled={
+                    Boolean(applying) ||
+                    !applyDraft.customModel.trim() ||
+                    applyDraft.models.includes(applyDraft.customModel.trim()) ||
+                    applyDraft.models.length >= 16
+                  }
+                />
+                <Text style={styles.muted}>最多选择 16 个模型；首个模型作为默认模型。</Text>
+                {applyDraft.target === "claude" && applyDraft.models.length > 1 ? (
+                  <Text style={styles.muted}>Claude Code 多模型候选列表需要 2.1.242 或更高版本。</Text>
+                ) : null}
+              </View>
+            ) : null}
+          </View>
           <View style={styles.row}>
             <Button
               label="取消"
@@ -807,25 +1182,17 @@ function PlanCard({
               disabled={actionsDisabled}
             />
             <Button
-              label={applying === applyDraft.target ? "写入中..." : `确认配置到 ${TARGET_LABELS[applyDraft.target]}`}
+              label={applying === applyDraft.target
+                ? "接入中..."
+                : `确认接入 ${TARGET_LABELS[applyDraft.target]}（${applyDraft.models.length} 个模型）`}
               onPress={onConfirmApply}
               styles={styles}
               primary
-              disabled={actionsDisabled || !applyDraft.model.trim()}
+              disabled={actionsDisabled || applyDraft.models.length === 0}
             />
           </View>
         </View>
       ) : null}
-      <View style={styles.row}>
-        <Button label="编辑 / 重新导入" onPress={onEdit} styles={styles} disabled={actionsDisabled} />
-        <Button
-          label={confirmDelete ? "再次点击确认删除" : "删除"}
-          onPress={onDelete}
-          styles={styles}
-          danger={confirmDelete}
-          disabled={actionsDisabled}
-        />
-      </View>
     </View>
   );
 }
@@ -1069,7 +1436,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
   const saveRpc = useRpc(savePlan) as (input: SavePlanInput) => Promise<Plan>;
   const deleteRpc = useRpc(deletePlan) as (input: { planId: string }) => Promise<{ deleted: boolean }>;
   const refreshRpc = useRpc(refreshUsage) as (input: { planId?: string }) => Promise<{ usage: UsageSnapshot[] }>;
-  const applyRpc = useRpc(applyPlan) as (input: ApplyDraft) => Promise<ApplyPlanResult>;
+  const applyRpc = useRpc(applyPlan) as (input: ApplyPlanInput) => Promise<ApplyPlanResult>;
   const queryKey = ["coding-plan-manager", host.id, "dashboard"] as const;
   const usageKey = ["coding-plan-manager", host.id, "usage"] as const;
   const [editor, setEditor] = useState<EditorState | null>(null);
@@ -1196,9 +1563,6 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
           <View style={styles.headerCopy}>
             <Text style={styles.eyebrow}>PLAN CONTROL · {host.label}</Text>
             <Text style={styles.title}>Coding Plans</Text>
-            <Text style={styles.subtitle}>
-              多账号额度在一个界面中轮询，并把选中的 Plan 投影到本机编码工具。保存后的凭据只存放在 Paseo daemon 主机。
-            </Text>
           </View>
           <View style={styles.headerActions}>
             <Button
@@ -1318,14 +1682,20 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
                     setApplyDraft({
                       planId: plan.id,
                       target,
-                      model: defaultModelFor(plan.provider, target),
+                      models: [defaultModelFor(plan.provider, target)],
+                      customModel: "",
+                      pickerOpen: true,
                     });
                   }}
-                  onChangeApplyModel={(model) => {
-                    if (applyDraft?.planId === plan.id) setApplyDraft({ ...applyDraft, model });
-                  }}
+                  onChangeApplyDraft={setApplyDraft}
                   onConfirmApply={() => {
-                    if (applyDraft?.planId === plan.id) applyMutation.mutate(applyDraft);
+                    if (applyDraft?.planId === plan.id) {
+                      applyMutation.mutate({
+                        planId: applyDraft.planId,
+                        target: applyDraft.target,
+                        models: applyDraft.models,
+                      });
+                    }
                   }}
                   onCancelApply={() => setApplyDraft(null)}
                   onEdit={() => {

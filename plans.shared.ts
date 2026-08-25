@@ -92,6 +92,15 @@ export const SavePlanInputSchema = z.object({
   useProxy: z.boolean().optional(),
 });
 
+export const ApplyPlanInputSchema = z.object({
+  planId: z.string(),
+  target: TargetSchema,
+  models: z.array(z.string().trim().min(1).max(256))
+    .min(1)
+    .max(16)
+    .transform((models) => [...new Set(models)]),
+});
+
 export const getDashboard = defineRpc({
   name: "coding-plans.dashboard.get",
   input: z.object({}),
@@ -118,11 +127,7 @@ export const refreshUsage = defineRpc({
 
 export const applyPlan = defineRpc({
   name: "coding-plans.target.apply",
-  input: z.object({
-    planId: z.string(),
-    target: TargetSchema,
-    model: z.string().trim().min(1).max(256),
-  }),
+  input: ApplyPlanInputSchema,
   output: ApplyPlanResultSchema,
 });
 
@@ -132,6 +137,7 @@ export type ZhipuRegion = z.infer<typeof ZhipuRegionSchema>;
 export type CodexAuthMode = z.infer<typeof CodexAuthModeSchema>;
 export type Plan = z.infer<typeof PlanSchema>;
 export type SavePlanInput = z.infer<typeof SavePlanInputSchema>;
+export type ApplyPlanInput = z.infer<typeof ApplyPlanInputSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 export type UsageSnapshot = z.infer<typeof UsageSnapshotSchema>;
 export type Dashboard = z.infer<typeof DashboardSchema>;

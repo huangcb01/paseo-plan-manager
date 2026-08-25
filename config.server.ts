@@ -79,6 +79,24 @@ function nonEmpty(value: string, description: string): string {
   return result;
 }
 
+function normalizeModels(values: readonly string[], description: string): string[] {
+  if (!Array.isArray(values)) throw new Error(`${description} must be an array`);
+  if (values.length === 0) throw new Error(`${description} must contain at least one model`);
+  if (values.length > 16) throw new Error(`${description} cannot contain more than 16 models`);
+  const models: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string") throw new Error(`${description} entries must be strings`);
+    const model = nonEmpty(value, `${description} entry`);
+    if (model.length > 256) throw new Error(`${description} entries cannot exceed 256 characters`);
+    if (!seen.has(model)) {
+      seen.add(model);
+      models.push(model);
+    }
+  }
+  return models;
+}
+
 export function providerProjection(plan: Plan): ProviderProjection {
   if (plan.provider === "kimi") {
     return {
@@ -150,14 +168,15 @@ function editJsonc(
   return result.endsWith(eol) ? result : `${result}${eol}`;
 }
 
-export function patchOpenCodeConfig(text: string | undefined, plan: Plan, selectedModel: string): string {
+export function patchOpenCodeConfig(text: string | undefined, plan: Plan, selectedModels: readonly string[]): string {
   const source = text?.trim() ? text : "{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}\n";
   const parsed = jsoncValue(source, "OpenCode config");
   if (parsed.provider !== undefined && !isObject(parsed.provider)) {
     throw new Error("OpenCode config.provider must be an object");
   }
 
-  const model = nonEmpty(selectedModel, "OpenCode model");
+  const models = normalizeModels(selectedModels, "OpenCode models");
+  const model = models[0];
   if (plan.provider === "codex") {
     return editJsonc(source, [
       { path: ["model"], value: `openai/${model}` },
@@ -172,9 +191,7 @@ export function patchOpenCodeConfig(text: string | undefined, plan: Plan, select
       baseURL: projection.opencode.baseUrl,
       setCacheKey: true,
     },
-    models: {
-      [model]: { name: model },
-    },
+    models: Object.fromEntries(models.map((candidate) => [candidate, { name: candidate }])),
   };
   return editJsonc(source, [
     { path: ["provider", projection.providerId], value: providerConfig },
@@ -367,7 +384,7 @@ function upsertRootTomlKeys(
 export function patchCodexConfig(
   text: string | undefined,
   plan: Plan,
-  selectedModel: string,
+  selectedModels: readonly string[],
   options: { apiKey?: string; modelCatalogPath?: string } = {},
 ): string {
   const source = text ?? "";
@@ -376,7 +393,8 @@ export function patchCodexConfig(
     throw new Error("Codex config with multiline TOML strings cannot be safely patched");
   }
   let result = removeManagedToml(source);
-  const model = nonEmpty(selectedModel, "Codex model");
+  const models = normalizeModels(selectedModels, "Codex models");
+  const model = models[0];
   if (plan.provider === "codex") {
     const updated = upsertRootTomlKeys(result, {
       model_provider: "openai",
@@ -420,7 +438,7 @@ export function patchClaudeSettings(
   text: string | undefined,
   plan: Plan,
   apiKey: string,
-  selectedModel: string,
+  selectedModels: readonly string[],
 ): string {
   if (plan.provider === "codex") {
     throw new Error("Claude Code cannot use a ChatGPT Codex OAuth plan without a protocol-conversion proxy");
@@ -429,10 +447,14 @@ export function patchClaudeSettings(
   if (settings.env !== undefined && !isObject(settings.env)) {
     throw new Error("Claude settings.json env must be an object");
   }
+  if (settings.modelPicker !== undefined && !isObject(settings.modelPicker)) {
+    throw new Error("Claude settings.json modelPicker must be an object");
+  }
   const env = isObject(settings.env) ? { ...settings.env } : {};
   const projection = providerProjection(plan);
-  const model = nonEmpty(selectedModel, "Claude model");
-  const contextTokens = plan.provider === "kimi" && /^(k3|k3\[1m\])$/.test(model)
+  const models = normalizeModels(selectedModels, "Claude models");
+  const model = models[0];
+  const contextTokens = plan.provider === "kimi" && models.every((candidate) => /^(k3|k3\[1m\])$/.test(candidate))
     ? "1048576"
     : projection.claude.contextTokens;
   delete env.ANTHROPIC_API_KEY;
@@ -451,7 +473,40 @@ export function patchClaudeSettings(
   };
   providerEnvironment[projection.claude.apiKeyField] = apiKey;
   Object.assign(env, providerEnvironment);
+  const modelPicker = isObject(settings.modelPicker) ? { ...settings.modelPicker } : {};
+  if (modelPicker.options !== undefined && !Array.isArray(modelPicker.options)) {
+    throw new Error("Claude settings.json modelPicker.options must be an array");
+  }
+  if (
+    modelPicker.replaceBuiltInOptions !== undefined &&
+    typeof modelPicker.replaceBuiltInOptions !== "boolean"
+  ) {
+    throw new Error("Claude settings.json modelPicker.replaceBuiltInOptions must be a boolean");
+  }
+  const options: Record<string, unknown>[] = [];
+  const pickerModels = new Set<string>();
+  for (const option of modelPicker.options ?? []) {
+    if (
+      !isObject(option) ||
+      typeof option.model !== "string" ||
+      (option.label !== undefined && typeof option.label !== "string") ||
+      (option.description !== undefined && typeof option.description !== "string")
+    ) {
+      throw new Error("Claude settings.json modelPicker.options entries must have compatible model, label, and description fields");
+    }
+    if (!pickerModels.has(option.model)) {
+      pickerModels.add(option.model);
+      options.push(option);
+    }
+  }
+  for (const candidate of models) {
+    if (!pickerModels.has(candidate)) {
+      pickerModels.add(candidate);
+      options.push({ model: candidate, label: candidate });
+    }
+  }
   settings.env = env;
+  settings.modelPicker = { ...modelPicker, options };
   return `${JSON.stringify(settings, null, 2)}\n`;
 }
 
@@ -462,12 +517,12 @@ export function patchClaudeState(text: string | undefined, plan: Plan): string {
   return `${JSON.stringify(state, null, 2)}\n`;
 }
 
-export function codexModelCatalog(selectedModel: string): string {
-  const model = nonEmpty(selectedModel, "Codex model");
-  const contextWindow = model === "glm-5.3" ? 1_048_576 : 204_800;
+export function codexModelCatalog(selectedModels: readonly string[]): string {
+  const models = normalizeModels(selectedModels, "Codex models");
   return `${JSON.stringify({
-    models: [
-      {
+    models: models.map((model) => {
+      const contextWindow = model === "glm-5.3" ? 1_048_576 : 204_800;
+      return {
         slug: model,
         display_name: model,
         description: "Z.AI GLM Coding Plan",
@@ -493,8 +548,8 @@ export function codexModelCatalog(selectedModel: string): string {
         supports_parallel_tool_calls: true,
         experimental_supported_tools: [],
         input_modalities: ["text"],
-      },
-    ],
+      };
+    }),
   }, null, 2)}\n`;
 }
 
@@ -609,9 +664,10 @@ async function writePair(
 async function applyOpenCode(
   plan: Plan,
   secret: PlanSecret,
-  model: string,
+  models: readonly string[],
   installed: boolean,
 ): Promise<ApplyResult> {
+  const selectedModels = normalizeModels(models, "OpenCode models");
   if (process.env.OPENCODE_CONFIG_CONTENT) {
     throw new Error("OPENCODE_CONFIG_CONTENT overrides files; refusing an ineffective switch");
   }
@@ -628,7 +684,7 @@ async function applyOpenCode(
     if (secret.kind !== "codex-auth") throw new Error("Codex OAuth credential is missing");
     absorbOpenCodeOAuth(plan, secret, authText);
   }
-  const nextConfig = patchOpenCodeConfig(configText, plan, model);
+  const nextConfig = patchOpenCodeConfig(configText, plan, selectedModels);
   const nextAuth = patchOpenCodeAuth(authText, plan, secret);
   await writePair(authPath, nextAuth, configPath, nextConfig, {
     expectedFirst: { text: authText },
@@ -654,9 +710,10 @@ async function applyOpenCode(
 async function applyCodex(
   plan: Plan,
   secret: PlanSecret,
-  model: string,
+  models: readonly string[],
   installed: boolean,
 ): Promise<ApplyResult> {
+  const selectedModels = normalizeModels(models, "Codex models");
   const directory = codexDirectory();
   const configPath = path.join(directory, "config.toml");
   const authPath = path.join(directory, "auth.json");
@@ -686,7 +743,7 @@ async function applyCodex(
     const tokens = codexTokens(auth);
     if (plan.accountId) tokens.account_id = plan.accountId;
     const nextAuth = `${JSON.stringify(auth, null, 2)}\n`;
-    const nextConfig = patchCodexConfig(configText, plan, model);
+    const nextConfig = patchCodexConfig(configText, plan, selectedModels);
     if (!installed) warnings.push("未检测到 Codex；仅写入配置，没有安装 Codex。");
     await writePair(authPath, nextAuth, configPath, nextConfig, {
       expectedFirst: { text: currentAuthText },
@@ -718,11 +775,11 @@ async function applyCodex(
   }
   if (secret.kind !== "api-key") throw new Error("API key is missing");
   const catalogPath = path.join(directory, "paseo-coding-plan-models.json");
-  const nextConfig = patchCodexConfig(configText, plan, model, {
+  const nextConfig = patchCodexConfig(configText, plan, selectedModels, {
     apiKey: secret.apiKey,
     modelCatalogPath: catalogPath,
   });
-  await writePair(catalogPath, codexModelCatalog(model), configPath, nextConfig, {
+  await writePair(catalogPath, codexModelCatalog(selectedModels), configPath, nextConfig, {
     secondMode: 0o600,
     expectedSecond: { text: configText },
   });
@@ -742,9 +799,10 @@ async function applyCodex(
 async function applyClaude(
   plan: Plan,
   secret: PlanSecret,
-  model: string,
+  models: readonly string[],
   installed: boolean,
 ): Promise<ApplyResult> {
+  const selectedModels = normalizeModels(models, "Claude models");
   if (plan.provider === "codex") {
     return {
       planId: plan.id,
@@ -764,7 +822,7 @@ async function applyClaude(
     readTextIfExists(settingsPath),
     readTextIfExists(statePath),
   ]);
-  const nextSettings = patchClaudeSettings(settingsText, plan, secret.apiKey, model);
+  const nextSettings = patchClaudeSettings(settingsText, plan, secret.apiKey, selectedModels);
   const nextState = patchClaudeState(stateText, plan);
   await writePair(statePath, nextState, settingsPath, nextSettings, {
     secondMode: 0o600,
@@ -773,6 +831,9 @@ async function applyClaude(
   });
   const warnings = ["Claude Code 配置投影尚未在本机做端到端测试。"];
   if (!installed) warnings.push("未检测到 Claude Code；仅写入配置，没有安装 Claude Code。");
+  if (selectedModels.length > 1) {
+    warnings.push("多个候选模型需要 Claude Code 2.1.242 或更高版本的 model picker 支持。");
+  }
   warnings.push("请新建 Claude Code 会话；已有会话不会可靠地切换认证信息。");
   return {
     planId: plan.id,
@@ -789,18 +850,18 @@ async function applyClaude(
 export async function applyPlanToTarget(
   planId: string,
   target: Target,
-  model: string,
+  models: readonly string[],
   store: PlanStore = planStore,
 ): Promise<ApplyResult> {
-  const selectedModel = nonEmpty(model, "Target model");
+  const selectedModels = normalizeModels(models, "Target models");
   const status = await toolsAndPaths();
   const installed = status.tools[target].installed;
   return store.withPlanForApply(planId, target, async (plan, secret) => {
     const result = target === "opencode"
-      ? await applyOpenCode(plan, secret, selectedModel, installed)
+      ? await applyOpenCode(plan, secret, selectedModels, installed)
       : target === "codex"
-        ? await applyCodex(plan, secret, selectedModel, installed)
-        : await applyClaude(plan, secret, selectedModel, installed);
+        ? await applyCodex(plan, secret, selectedModels, installed)
+        : await applyClaude(plan, secret, selectedModels, installed);
     return { result, applied: result.applied };
   });
 }

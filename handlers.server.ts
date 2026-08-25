@@ -1,4 +1,4 @@
-import type { SavePlanInput, Target } from "./plans.shared";
+import type { ApplyPlanInput, SavePlanInput } from "./plans.shared";
 import { applyPlanToTarget, toolsAndPaths } from "./config.server";
 import { planStore } from "./store.server";
 import { cachedUsage, refreshUsageSnapshots } from "./usage.server";
@@ -32,6 +32,6 @@ export async function handleRefreshUsage({ planId }: { planId?: string }) {
   return { usage: await refreshUsageSnapshots(planId) };
 }
 
-export async function handleApplyPlan({ planId, target, model }: { planId: string; target: Target; model: string }) {
-  return applyPlanToTarget(planId, target, model);
+export async function handleApplyPlan({ planId, target, models }: ApplyPlanInput) {
+  return applyPlanToTarget(planId, target, models);
 }
