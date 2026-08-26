@@ -1,0 +1,1071 @@
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  Agent,
+  EnvHttpProxyAgent,
+  fetch as undiciFetch,
+  type Dispatcher,
+  type Response as UndiciResponse,
+} from "undici";
+import type {
+  Plan,
+  QuotaSampleWindow,
+  TokenActivity,
+  TokenActivityPoint,
+  UsageSnapshot,
+  UsageWindow,
+} from "./plans.shared";
+import {
+  codexAccountId,
+  codexTokens,
+  parseJwtPayload,
+  type PlanSecret,
+  type PlanStore,
+  planStore,
+} from "./store.server";
+
+const MAX_RESPONSE_BYTES = 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 6_000;
+const HISTORY_REQUEST_BUDGET_MS = 8_000;
+// Covers current usage and history together, leaving RPC time for cache I/O and serialization.
+const REFRESH_BUDGET_MS = 24_000;
+const MIN_CACHE_WRITE_BUDGET_MS = 2_000;
+export const LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS = 5 * 60;
+const LOCAL_QUOTA_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCAL_QUOTA_HISTORY_MAX_POINTS = Math.ceil(
+  LOCAL_QUOTA_HISTORY_RETENTION_MS / (LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS * 1000),
+) + 1;
+
+interface UsageProxyOptions {
+  httpProxy: string;
+  httpsProxy: string;
+  noProxy: string;
+}
+
+function nonEmptyEnvironmentValue(...values: Array<string | undefined>): string {
+  return values.find((value) => Boolean(value?.trim()))?.trim() ?? "";
+}
+
+function usageProxyOptions(environment: NodeJS.ProcessEnv): UsageProxyOptions {
+  return {
+    httpProxy: nonEmptyEnvironmentValue(environment.http_proxy, environment.HTTP_PROXY),
+    httpsProxy: nonEmptyEnvironmentValue(environment.https_proxy, environment.HTTPS_PROXY),
+    noProxy: nonEmptyEnvironmentValue(environment.no_proxy, environment.NO_PROXY),
+  };
+}
+
+export function usageProxyConfigured(environment: NodeJS.ProcessEnv = process.env): boolean {
+  const options = usageProxyOptions(environment);
+  return Boolean(options.httpsProxy || options.httpProxy);
+}
+
+export class UsageDispatcherPool {
+  readonly direct: Dispatcher = new Agent();
+  private proxy?: Dispatcher;
+
+  constructor(private readonly environment: NodeJS.ProcessEnv = process.env) {}
+
+  dispatcher(useProxy: boolean): Dispatcher {
+    if (!useProxy) return this.direct;
+    const options = usageProxyOptions(this.environment);
+    if (!options.httpsProxy && !options.httpProxy) {
+      throw new Error("Proxy is enabled for this Plan, but HTTPS_PROXY or HTTP_PROXY is not configured");
+    }
+    if (!this.proxy) {
+      try {
+        this.proxy = new EnvHttpProxyAgent(options);
+      } catch {
+        throw new Error("The HTTPS_PROXY or HTTP_PROXY configuration is invalid");
+      }
+    }
+    return this.proxy;
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([this.direct.close(), this.proxy?.close()]);
+  }
+}
+
+const usageDispatcherPool = new UsageDispatcherPool();
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly retryAfterMs?: number,
+  ) {
+    super(status === 401 || status === 403
+      ? `Authentication failed (HTTP ${status})`
+      : `Provider returned HTTP ${status}`);
+  }
+}
+
+class ProviderPayloadError extends Error {}
+
+class ProviderRequestError extends Error {}
+
+async function beforeRefreshDeadline<T>(operation: () => Promise<T>, deadline: number): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("Usage refresh deadline exceeded");
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Usage refresh deadline exceeded")), remaining);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function valueAt(object: Record<string, unknown>, ...keys: string[]): unknown {
+  for (const key of keys) {
+    if (object[key] !== undefined && object[key] !== null) return object[key];
+  }
+  return undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function dateKey(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const calendar = value.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (calendar) return calendar[1];
+  }
+  const numeric = numberValue(value);
+  const milliseconds = numeric === undefined
+    ? typeof value === "string" ? Date.parse(value) : NaN
+    : numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  if (!Number.isFinite(milliseconds)) return undefined;
+  return new Date(milliseconds).toISOString().slice(0, 10);
+}
+
+function tokenActivity(points: Map<string, { tokens: number; calls: number; hasCalls: boolean }>): TokenActivity {
+  const normalized: TokenActivityPoint[] = [...points.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([date, point]) => ({
+      date,
+      tokens: point.tokens,
+      ...(point.hasCalls ? { calls: point.calls } : {}),
+    }));
+  return { source: "provider", granularity: "day", points: normalized };
+}
+
+function addTokenActivityPoint(
+  points: Map<string, { tokens: number; calls: number; hasCalls: boolean }>,
+  date: string,
+  tokens: number,
+  calls: number | undefined,
+): void {
+  const current = points.get(date) ?? { tokens: 0, calls: 0, hasCalls: false };
+  current.tokens += Math.max(0, tokens);
+  if (calls !== undefined) {
+    current.calls += Math.max(0, Math.trunc(calls));
+    current.hasCalls = true;
+  }
+  points.set(date, current);
+}
+
+function clampPercent(value: number | undefined): number | undefined {
+  return value === undefined ? undefined : Math.max(0, Math.min(100, value));
+}
+
+function percentFrom(used: string | undefined, limit: string | undefined): number | undefined {
+  const usedNumber = numberValue(used);
+  const limitNumber = numberValue(limit);
+  if (usedNumber === undefined || limitNumber === undefined || limitNumber <= 0) return undefined;
+  return clampPercent((usedNumber / limitNumber) * 100);
+}
+
+function timestampIso(value: unknown, unit: "seconds" | "milliseconds" | "iso"): string | undefined {
+  let milliseconds: number | undefined;
+  if (unit === "iso" && typeof value === "string") {
+    const normalized = value.replace(/(\.\d{3})\d+(Z|[+-]\d\d:\d\d)$/, "$1$2");
+    milliseconds = Date.parse(normalized);
+  } else {
+    const numeric = numberValue(value);
+    if (numeric !== undefined) milliseconds = unit === "seconds" ? numeric * 1000 : numeric;
+  }
+  if (milliseconds === undefined || !Number.isFinite(milliseconds)) return undefined;
+  return new Date(milliseconds).toISOString();
+}
+
+function durationLabel(seconds: number | undefined, fallback: string): string {
+  if (!seconds || seconds <= 0) return fallback;
+  if (seconds % 604800 === 0) return `${seconds / 604800} 周`;
+  if (seconds % 86400 === 0) return `${seconds / 86400} 天`;
+  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
+  if (seconds % 60 === 0) return `${seconds / 60} 分钟`;
+  return fallback;
+}
+
+async function readResponseJson(response: UndiciResponse): Promise<unknown> {
+  if (!response.body) throw new ProviderPayloadError("Provider returned an empty response");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new ProviderPayloadError("Provider response exceeded the size limit");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new ProviderPayloadError("Provider returned invalid JSON");
+  }
+}
+
+async function fetchJson(
+  urlText: string,
+  headers: Record<string, string>,
+  allowedHosts: readonly string[],
+  deadline: number,
+  dispatcher: Dispatcher,
+  options: { attempts?: number; timeoutMs?: number } = {},
+): Promise<unknown> {
+  const url = new URL(urlText);
+  if (
+    url.protocol !== "https:" ||
+    !allowedHosts.includes(url.hostname) ||
+    (url.port && url.port !== "443") ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error("Refusing an unexpected provider URL");
+  }
+  if (Object.values(headers).some((value) => /[\r\n]/.test(value))) {
+    throw new ProviderRequestError("Provider credential contains invalid line breaks");
+  }
+
+  let lastError: unknown;
+  const attempts = Math.max(1, options.attempts ?? 2);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Usage refresh deadline exceeded");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Math.min(options.timeoutMs ?? REQUEST_TIMEOUT_MS, remaining));
+    try {
+      const response = await undiciFetch(url, {
+        method: "GET",
+        headers,
+        redirect: "manual",
+        signal: controller.signal,
+        dispatcher,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        await response.body?.cancel();
+        const retryAfter = response.headers.get("retry-after");
+        const retryAfterMs = retryAfter && /^\d+$/.test(retryAfter)
+          ? Number(retryAfter) * 1000
+          : undefined;
+        throw new HttpError(response.status, retryAfterMs);
+      }
+      return await readResponseJson(response);
+    } catch (error) {
+      lastError = error;
+      const status = error instanceof HttpError ? error.status : undefined;
+      const retryable = !(error instanceof ProviderPayloadError) &&
+        (status === 429 || (status !== undefined && status >= 500) || status === undefined);
+      if (!retryable || attempt === attempts - 1 || Date.now() >= deadline) break;
+      const wait = error instanceof HttpError && error.retryAfterMs !== undefined
+        ? Math.min(error.retryAfterMs, 10_000)
+        : 400 * 2 ** attempt + Math.floor(Math.random() * 200);
+      await delay(Math.min(wait, Math.max(0, deadline - Date.now())));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  if ((lastError as Error)?.name === "AbortError") throw new Error("Provider request timed out");
+  if (lastError instanceof HttpError || lastError instanceof ProviderPayloadError) throw lastError;
+  throw new ProviderRequestError("Provider request failed");
+}
+
+function codexWindow(
+  raw: unknown,
+  id: string,
+  fallbackLabel: string,
+): UsageWindow | undefined {
+  if (!isObject(raw)) return undefined;
+  const windowSeconds = numberValue(valueAt(raw, "limit_window_seconds", "limitWindowSeconds"));
+  const resetAt = timestampIso(valueAt(raw, "reset_at", "resetAt"), "seconds") ?? (() => {
+    const after = numberValue(valueAt(raw, "reset_after_seconds", "resetAfterSeconds"));
+    return after === undefined ? undefined : new Date(Date.now() + after * 1000).toISOString();
+  })();
+  const usedPercent = clampPercent(numberValue(valueAt(raw, "used_percent", "usedPercent")));
+  return {
+    id,
+    label: durationLabel(windowSeconds, fallbackLabel),
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    ...(resetAt ? { resetAt } : {}),
+    ...(windowSeconds !== undefined ? { windowSeconds } : {}),
+  };
+}
+
+function codexSpendControlWindow(raw: unknown): UsageWindow | undefined {
+  if (!isObject(raw)) return undefined;
+  const reached = raw.reached === true;
+  const individualLimit = valueAt(raw, "individual_limit", "individualLimit");
+  if (!isObject(individualLimit)) {
+    const limit = stringValue(individualLimit);
+    if (limit !== undefined) {
+      return {
+        id: "spend-control",
+        label: "个人额度",
+        ...(reached ? { usedPercent: 100 } : {}),
+        limit,
+      };
+    }
+    return reached ? { id: "spend-control", label: "个人额度", usedPercent: 100 } : undefined;
+  }
+  const used = stringValue(individualLimit.used);
+  const limit = stringValue(individualLimit.limit);
+  const remaining = stringValue(individualLimit.remaining);
+  const explicitPercent = clampPercent(numberValue(valueAt(
+    individualLimit,
+    "used_percent",
+    "usedPercent",
+  )));
+  const usedPercent = reached ? 100 : explicitPercent ?? percentFrom(used, limit);
+  const resetAt = timestampIso(valueAt(individualLimit, "reset_at", "resetAt"), "seconds") ?? (() => {
+    const after = numberValue(valueAt(
+      individualLimit,
+      "reset_after_seconds",
+      "resetAfterSeconds",
+    ));
+    return after === undefined ? undefined : new Date(Date.now() + after * 1000).toISOString();
+  })();
+  return {
+    id: "spend-control",
+    label: "个人额度",
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    ...(used ? { used } : {}),
+    ...(limit ? { limit } : {}),
+    ...(remaining ? { remaining } : {}),
+    ...(resetAt ? { resetAt } : {}),
+  };
+}
+
+export function normalizeCodexUsage(raw: unknown, planId: string): UsageSnapshot {
+  if (!isObject(raw)) throw new Error("Codex usage response has an unexpected shape");
+  if (raw.error !== undefined) throw new Error("Codex usage API rejected the request");
+  const spendControl = valueAt(raw, "spend_control", "spendControl");
+  if (
+    valueAt(raw, "plan_type", "planType") === undefined &&
+    valueAt(raw, "rate_limit", "rateLimit") === undefined &&
+    raw.credits === undefined &&
+    spendControl === undefined
+  ) {
+    throw new Error("Codex usage response does not contain quota data");
+  }
+  const windows: UsageWindow[] = [];
+  const rateLimit = valueAt(raw, "rate_limit", "rateLimit");
+  if (isObject(rateLimit)) {
+    const primary = codexWindow(valueAt(rateLimit, "primary_window", "primaryWindow"), "primary", "主窗口");
+    const secondary = codexWindow(
+      valueAt(rateLimit, "secondary_window", "secondaryWindow"),
+      "secondary",
+      "次窗口",
+    );
+    if (primary) windows.push(primary);
+    if (secondary) windows.push(secondary);
+  }
+
+  const additional = valueAt(raw, "additional_rate_limits", "additionalRateLimits");
+  if (Array.isArray(additional)) {
+    additional.forEach((entry, index) => {
+      if (!isObject(entry)) return;
+      const details = valueAt(entry, "rate_limit", "rateLimit");
+      const name = stringValue(valueAt(entry, "limit_name", "limitName")) ?? `附加限额 ${index + 1}`;
+      if (!isObject(details)) return;
+      const primary = codexWindow(
+        valueAt(details, "primary_window", "primaryWindow"),
+        `additional-${index}-primary`,
+        name,
+      );
+      const secondary = codexWindow(
+        valueAt(details, "secondary_window", "secondaryWindow"),
+        `additional-${index}-secondary`,
+        `${name}（次窗口）`,
+      );
+      if (primary) windows.push({ ...primary, label: `${name} · ${primary.label}` });
+      if (secondary) windows.push({ ...secondary, label: `${name} · ${secondary.label}` });
+    });
+  }
+  const spendControlWindow = codexSpendControlWindow(spendControl);
+  if (spendControlWindow) windows.push(spendControlWindow);
+
+  const credits = valueAt(raw, "credits");
+  const balance = isObject(credits) ? stringValue(credits.balance) : undefined;
+  return {
+    planId,
+    status: "ok",
+    stale: false,
+    fetchedAt: new Date().toISOString(),
+    windows,
+    ...(stringValue(valueAt(raw, "plan_type", "planType"))
+      ? { planTier: stringValue(valueAt(raw, "plan_type", "planType")) }
+      : {}),
+    ...(balance ? { balance } : {}),
+  };
+}
+
+export function normalizeCodexTokenActivity(raw: unknown): TokenActivity {
+  if (!isObject(raw)) {
+    throw new Error("Codex token activity response has an unexpected shape");
+  }
+  const metadata = isObject(raw.metadata) ? raw.metadata : undefined;
+  const statsError = metadata
+    ? stringValue(valueAt(metadata, "stats_error", "statsError"))
+    : undefined;
+  if (statsError) throw new Error(`Codex token activity is unavailable: ${statsError}`);
+  const stats = isObject(raw.stats) ? raw.stats : raw;
+  let buckets = stats.daily_usage_buckets !== undefined
+    ? stats.daily_usage_buckets
+    : stats.dailyUsageBuckets;
+  if (buckets === undefined && stats !== raw) {
+    buckets = raw.daily_usage_buckets !== undefined
+      ? raw.daily_usage_buckets
+      : raw.dailyUsageBuckets;
+  }
+  if (buckets === null) {
+    return tokenActivity(new Map());
+  }
+  if (buckets === undefined) {
+    throw new Error("Codex token activity response omitted daily buckets");
+  }
+  if (!Array.isArray(buckets)) {
+    throw new Error("Codex token activity response does not contain daily buckets");
+  }
+  const points = new Map<string, { tokens: number; calls: number; hasCalls: boolean }>();
+  for (const bucket of buckets) {
+    if (!isObject(bucket)) continue;
+    const date = dateKey(valueAt(bucket, "start_date", "startDate"));
+    const tokens = numberValue(bucket.tokens);
+    if (!date || tokens === undefined || tokens < 0) continue;
+    addTokenActivityPoint(points, date, tokens, undefined);
+  }
+  return tokenActivity(points);
+}
+
+function summedModelSeries(models: unknown, ...keys: string[]): number[] | undefined {
+  if (!Array.isArray(models)) return undefined;
+  const totals: number[] = [];
+  let found = false;
+  for (const model of models) {
+    if (!isObject(model)) continue;
+    const rawSeries = valueAt(model, ...keys);
+    if (!Array.isArray(rawSeries)) continue;
+    rawSeries.forEach((value, index) => {
+      const numeric = numberValue(value);
+      if (numeric === undefined) return;
+      totals[index] = (totals[index] ?? 0) + numeric;
+      found = true;
+    });
+  }
+  return found ? totals : undefined;
+}
+
+export function normalizeZhipuTokenActivity(raw: unknown): TokenActivity {
+  if (!isObject(raw)) throw new Error("GLM token activity response has an unexpected shape");
+  if (raw.success === false || (numberValue(raw.code) ?? 200) >= 400) {
+    throw new Error("GLM token activity API rejected the request");
+  }
+  const data = isObject(raw.data) ? raw.data : raw;
+  const times = valueAt(data, "x_time", "xTime");
+  if (!Array.isArray(times)) {
+    throw new Error("GLM token activity response does not contain time buckets");
+  }
+  const models = valueAt(data, "modelDataList", "model_data_list");
+  const rawTokens = valueAt(data, "tokensUsage", "tokens_usage");
+  const tokens = Array.isArray(rawTokens)
+    ? rawTokens
+    : summedModelSeries(models, "tokensUsage", "tokens_usage");
+  if (!tokens) {
+    if (times.length === 0) return tokenActivity(new Map());
+    throw new Error("GLM token activity response does not contain token buckets");
+  }
+  const rawCalls = valueAt(data, "modelCallCount", "model_call_count");
+  const calls = Array.isArray(rawCalls)
+    ? rawCalls
+    : summedModelSeries(models, "modelCallCount", "model_call_count", "callCount", "call_count");
+  const points = new Map<string, { tokens: number; calls: number; hasCalls: boolean }>();
+  times.forEach((time, index) => {
+    const date = dateKey(time);
+    const tokenCount = numberValue(tokens[index]);
+    const callCount = calls ? numberValue(calls[index]) : undefined;
+    if (!date || tokenCount === undefined || tokenCount < 0) return;
+    addTokenActivityPoint(points, date, tokenCount, callCount);
+  });
+  return tokenActivity(points);
+}
+
+export function normalizeZhipuUsage(raw: unknown, planId: string): UsageSnapshot {
+  if (!isObject(raw)) throw new Error("GLM usage response has an unexpected shape");
+  if (raw.success === false || (numberValue(raw.code) ?? 200) >= 400) {
+    throw new Error("GLM usage API rejected the request");
+  }
+  const data = isObject(raw.data) ? raw.data : raw;
+  if (!Array.isArray(data.limits)) throw new Error("GLM usage response does not contain quota limits");
+  const limits = data.limits;
+  const quotaWindows: Array<{ window: UsageWindow; unit?: number }> = [];
+  const otherWindows: UsageWindow[] = [];
+  limits.forEach((entry, index) => {
+    if (!isObject(entry)) return;
+    const type = (stringValue(entry.type) ?? `LIMIT_${index}`).toUpperCase();
+    const unit = numberValue(entry.unit);
+    let label = type;
+    if (type === "TOKENS_LIMIT" || type === "CREDIT_LIMIT") {
+      label = unit === 3 ? "5 小时" : unit === 6 ? "每周" : "额度窗口";
+    } else if (type === "TIME_LIMIT") {
+      label = "MCP 月度";
+    }
+    const used = stringValue(valueAt(entry, "currentValue", "current_value"));
+    const limit = stringValue(entry.usage);
+    const remaining = stringValue(entry.remaining);
+    const usedPercent = clampPercent(numberValue(entry.percentage));
+    const resetAt = timestampIso(valueAt(entry, "nextResetTime", "next_reset_time"), "milliseconds");
+    const window: UsageWindow = {
+      id: `${type.toLowerCase()}-${index}`,
+      label,
+      ...(usedPercent !== undefined ? { usedPercent } : {}),
+      ...(used ? { used } : {}),
+      ...(limit ? { limit } : {}),
+      ...(remaining ? { remaining } : {}),
+      ...(resetAt ? { resetAt } : {}),
+    };
+    if (type === "TOKENS_LIMIT" || type === "CREDIT_LIMIT") quotaWindows.push({ window, unit });
+    else otherWindows.push(window);
+  });
+  const classified = [
+    ...quotaWindows.filter((entry) => entry.unit === 3),
+    ...quotaWindows.filter((entry) => entry.unit === 6),
+    ...quotaWindows.filter((entry) => entry.unit !== 3 && entry.unit !== 6),
+  ];
+  let fallbackIndex = 0;
+  const windows = [
+    ...classified.map(({ window, unit }) => {
+      if (unit === 3 || unit === 6) return window;
+      const label = fallbackIndex === 0 ? "5 小时" : fallbackIndex === 1 ? "每周" : `额度窗口 ${fallbackIndex + 1}`;
+      fallbackIndex += 1;
+      return { ...window, label };
+    }),
+    ...otherWindows,
+  ];
+  return {
+    planId,
+    status: "ok",
+    stale: false,
+    fetchedAt: new Date().toISOString(),
+    windows,
+    ...(stringValue(valueAt(data, "level", "planName"))
+      ? { planTier: stringValue(valueAt(data, "level", "planName")) }
+      : {}),
+  };
+}
+
+function kimiReset(value: unknown, detail: Record<string, unknown>): string | undefined {
+  const absolute = timestampIso(value, "iso");
+  if (absolute) return absolute;
+  const relative = numberValue(valueAt(detail, "reset_in", "resetIn", "ttl"));
+  if (relative === undefined) return undefined;
+  const rounded = Math.round((Date.now() + relative * 1000) / 60_000) * 60_000;
+  return new Date(rounded).toISOString();
+}
+
+function kimiWindowLabel(duration: number | undefined, unit: string | undefined, fallback: string): string {
+  if (!duration || !unit) return fallback;
+  const normalizedUnit = unit.replace(/^TIME_UNIT_/i, "").toLowerCase();
+  if (normalizedUnit.startsWith("minute")) {
+    return duration % 60 === 0 ? `${duration / 60} 小时` : `${duration} 分钟`;
+  }
+  if (normalizedUnit.startsWith("hour")) return `${duration} 小时`;
+  if (normalizedUnit.startsWith("day")) return `${duration} 天`;
+  if (normalizedUnit.startsWith("week")) return duration === 1 ? "每周" : `${duration} 周`;
+  return fallback;
+}
+
+function kimiUsedPercent(
+  used: string | undefined,
+  remaining: string | undefined,
+  limit: string | undefined,
+): number | undefined {
+  const explicit = percentFrom(used, limit);
+  if (explicit !== undefined) return explicit;
+  const remainingNumber = numberValue(remaining);
+  const limitNumber = numberValue(limit);
+  if (remainingNumber === undefined || limitNumber === undefined || limitNumber <= 0) return undefined;
+  return clampPercent(((limitNumber - remainingNumber) / limitNumber) * 100);
+}
+
+function kimiWindow(raw: unknown, id: string, fallbackLabel: string): UsageWindow | undefined {
+  if (!isObject(raw)) return undefined;
+  const detail = isObject(raw.detail) ? raw.detail : raw;
+  const used = stringValue(detail.used);
+  const limit = stringValue(detail.limit);
+  const remaining = stringValue(detail.remaining);
+  const resetAt = kimiReset(valueAt(detail, "resetTime", "reset_time", "resetAt", "reset_at"), detail);
+  const windowInfo = isObject(raw.window) ? raw.window : undefined;
+  const duration = windowInfo ? numberValue(windowInfo.duration) : undefined;
+  const unit = windowInfo ? stringValue(valueAt(windowInfo, "timeUnit", "time_unit")) : undefined;
+  const label = kimiWindowLabel(duration, unit, fallbackLabel);
+  const usedPercent = kimiUsedPercent(used, remaining, limit);
+  return {
+    id,
+    label,
+    ...(used ? { used } : {}),
+    ...(limit ? { limit } : {}),
+    ...(remaining ? { remaining } : {}),
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    ...(resetAt ? { resetAt } : {}),
+  };
+}
+
+function kimiWindowId(raw: unknown, index: number): string {
+  if (!isObject(raw) || !isObject(raw.window)) return `window-${index}`;
+  const duration = numberValue(raw.window.duration);
+  const unit = stringValue(valueAt(raw.window, "timeUnit", "time_unit"));
+  if (duration === undefined || !unit) return `window-${index}`;
+  const normalizedUnit = unit.replace(/^TIME_UNIT_/i, "").toLowerCase();
+  if (normalizedUnit.startsWith("minute") && duration >= 60 && duration % 60 === 0) {
+    return `window-${duration / 60}-hour`;
+  }
+  return `window-${duration}-${normalizedUnit}`;
+}
+
+export function normalizeKimiUsage(raw: unknown, planId: string): UsageSnapshot {
+  if (!isObject(raw)) throw new Error("Kimi usage response has an unexpected shape");
+  if (raw.error !== undefined || raw.code === "access_terminated_error") {
+    throw new Error("Kimi usage API rejected the request");
+  }
+  if (raw.usage === undefined && raw.limits === undefined && raw.parallel === undefined) {
+    throw new Error("Kimi usage response does not contain quota data");
+  }
+  const windows: UsageWindow[] = [];
+  if (Array.isArray(raw.limits)) {
+    const ids = new Map<string, number>();
+    raw.limits.forEach((entry, index) => {
+      const baseId = kimiWindowId(entry, index);
+      const occurrence = (ids.get(baseId) ?? 0) + 1;
+      ids.set(baseId, occurrence);
+      const id = occurrence === 1 ? baseId : `${baseId}-${occurrence}`;
+      const window = kimiWindow(entry, id, `限流窗口 ${index + 1}`);
+      if (window) windows.push(window);
+    });
+  }
+  const weekly = kimiWindow(raw.usage, "weekly", "每周");
+  if (weekly) windows.push(weekly);
+  const parallel = isObject(raw.parallel) ? stringValue(raw.parallel.limit) : undefined;
+  return {
+    planId,
+    status: "ok",
+    stale: false,
+    fetchedAt: new Date().toISOString(),
+    windows,
+    ...(parallel ? { parallelLimit: parallel } : {}),
+  };
+}
+
+function latestSampleWindow(
+  points: NonNullable<UsageSnapshot["quotaHistory"]>["points"],
+  windowId: string,
+): QuotaSampleWindow | undefined {
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    const match = points[index].windows.find((window) => window.id === windowId);
+    if (match) return match;
+  }
+  return undefined;
+}
+
+function resetAtChanged(previous: string | undefined, current: string | undefined): boolean {
+  if (!previous || !current) return false;
+  const previousTime = Date.parse(previous);
+  const currentTime = Date.parse(current);
+  if (Number.isFinite(previousTime) && Number.isFinite(currentTime)) {
+    return Math.abs(previousTime - currentTime) > 60_000;
+  }
+  return previous !== current;
+}
+
+export function appendKimiQuotaHistory(
+  snapshot: UsageSnapshot,
+  previous?: UsageSnapshot,
+  now = Date.now(),
+): UsageSnapshot {
+  const cutoff = now - LOCAL_QUOTA_HISTORY_RETENTION_MS;
+  const existing = previous?.quotaHistory?.source === "local"
+    ? previous.quotaHistory.points.filter((point) => {
+        const timestamp = Date.parse(point.sampledAt);
+        return Number.isFinite(timestamp) && timestamp >= cutoff && timestamp <= now;
+      })
+    : [];
+  const lastSampleAt = existing.length ? Date.parse(existing[existing.length - 1].sampledAt) : NaN;
+  const elapsed = now - lastSampleAt;
+  if (Number.isFinite(lastSampleAt) && elapsed >= 0 && elapsed < LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS * 1000) {
+    return {
+      ...snapshot,
+      quotaHistory: {
+        source: "local",
+        intervalSeconds: LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS,
+        points: existing,
+      },
+    };
+  }
+
+  const windows: QuotaSampleWindow[] = snapshot.windows.flatMap((window) => {
+    if (window.usedPercent === undefined || !Number.isFinite(window.usedPercent)) return [];
+    const usedPercent = Math.max(0, Math.min(100, window.usedPercent));
+    const prior = latestSampleWindow(existing, window.id);
+    const changedReset = resetAtChanged(prior?.resetAt, window.resetAt);
+    const usageDropped = prior !== undefined && usedPercent + 0.01 < prior.usedPercent;
+    return [{
+      id: window.id,
+      label: window.label,
+      usedPercent,
+      ...(window.resetAt ? { resetAt: window.resetAt } : {}),
+      ...(changedReset || usageDropped ? { reset: true } : {}),
+    }];
+  });
+  if (windows.length === 0 && existing.length === 0) return snapshot;
+  const points = windows.length
+    ? [...existing, { sampledAt: new Date(now).toISOString(), windows }]
+    : existing;
+  return {
+    ...snapshot,
+    quotaHistory: {
+      source: "local",
+      intervalSeconds: LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS,
+      points: points.slice(-LOCAL_QUOTA_HISTORY_MAX_POINTS),
+    },
+  };
+}
+
+function formatLocalDateTime(value: Date): string {
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+}
+
+function zhipuTokenActivityUrl(host: string, now = new Date()): string {
+  const start = new Date(now);
+  start.setDate(start.getDate() - 29);
+  start.setHours(0, 0, 0, 0);
+  const url = new URL(`https://${host}/api/monitor/usage/model-usage`);
+  url.searchParams.set("startTime", formatLocalDateTime(start));
+  url.searchParams.set("endTime", formatLocalDateTime(now));
+  return url.toString();
+}
+
+interface TokenActivityFetchResult {
+  tokenActivity?: TokenActivity;
+  tokenActivityStale: boolean;
+  tokenActivityError?: string;
+}
+
+async function optionalTokenActivity(
+  request: Promise<unknown>,
+  normalize: (raw: unknown) => TokenActivity,
+  secret: PlanSecret,
+): Promise<TokenActivityFetchResult> {
+  try {
+    return { tokenActivity: normalize(await request), tokenActivityStale: false };
+  } catch (error) {
+    return { tokenActivityStale: true, tokenActivityError: safeError(error, secret) };
+  }
+}
+
+function jwtExpiry(auth: Record<string, unknown>): number | undefined {
+  const tokens = codexTokens(auth);
+  const claims = parseJwtPayload(typeof tokens.access_token === "string" ? tokens.access_token : undefined);
+  const expires = claims ? numberValue(claims.exp) : undefined;
+  return expires === undefined ? undefined : expires * 1000;
+}
+
+function codexUsageHeaders(plan: Plan, secret: PlanSecret): Record<string, string> {
+  if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
+  const expiresAt = jwtExpiry(secret.auth);
+  if (expiresAt !== undefined && expiresAt <= Date.now()) {
+    throw new Error("Codex access token has expired; run Codex with this account, then re-import auth.json");
+  }
+  const tokens = codexTokens(secret.auth);
+  const accountId = plan.accountId ?? codexAccountId(secret.auth);
+  const idToken = typeof tokens.id_token === "string" ? tokens.id_token : undefined;
+  const claims = parseJwtPayload(idToken);
+  const namespaced = claims?.["https://api.openai.com/auth"];
+  const fedramp = isObject(namespaced) && namespaced.chatgpt_account_is_fedramp === true;
+  return {
+    Authorization: `Bearer ${String(tokens.access_token)}`,
+    "User-Agent": "paseo-coding-plan-manager/0.1.0",
+    ...(accountId ? { "ChatGPT-Account-ID": accountId } : {}),
+    ...(fedramp ? { "X-OpenAI-Fedramp": "true" } : {}),
+  };
+}
+
+function zhipuHost(plan: Plan): string {
+  return plan.region === "global"
+    ? "api.z.ai"
+    : plan.region === "cn-dev"
+      ? "dev.bigmodel.cn"
+      : "open.bigmodel.cn";
+}
+
+async function fetchPlanUsage(
+  plan: Plan,
+  secret: PlanSecret,
+  deadline: number,
+): Promise<UsageSnapshot> {
+  const dispatcher = usageDispatcherPool.dispatcher(plan.useProxy);
+
+  if (plan.provider === "codex") {
+    const raw = await fetchJson(
+      "https://chatgpt.com/backend-api/wham/usage",
+      codexUsageHeaders(plan, secret),
+      ["chatgpt.com"],
+      deadline,
+      dispatcher,
+    );
+    return normalizeCodexUsage(raw, plan.id);
+  }
+
+  if (secret.kind !== "api-key") throw new Error("API key is missing");
+  if (plan.provider === "kimi") {
+    const raw = await fetchJson(
+      "https://api.kimi.com/coding/v1/usages",
+      {
+        Authorization: `Bearer ${secret.apiKey}`,
+        Accept: "application/json",
+        "User-Agent": "KimiCLI/1.6 paseo-coding-plan-manager/0.1.0",
+      },
+      ["api.kimi.com"],
+      deadline,
+      dispatcher,
+    );
+    return normalizeKimiUsage(raw, plan.id);
+  }
+
+  const host = zhipuHost(plan);
+  const headers = {
+    Authorization: secret.apiKey,
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    Accept: "application/json",
+  };
+  const raw = await fetchJson(
+    `https://${host}/api/monitor/usage/quota/limit`,
+    headers,
+    ["open.bigmodel.cn", "dev.bigmodel.cn", "api.z.ai"],
+    deadline,
+    dispatcher,
+  );
+  return normalizeZhipuUsage(raw, plan.id);
+}
+
+async function fetchPlanTokenActivity(
+  plan: Plan,
+  secret: PlanSecret,
+  deadline: number,
+): Promise<TokenActivityFetchResult | undefined> {
+  if (plan.provider === "kimi") return undefined;
+  try {
+    const dispatcher = usageDispatcherPool.dispatcher(plan.useProxy);
+    if (plan.provider === "codex") {
+      return optionalTokenActivity(
+        fetchJson(
+          "https://chatgpt.com/backend-api/wham/profiles/me",
+          codexUsageHeaders(plan, secret),
+          ["chatgpt.com"],
+          deadline,
+          dispatcher,
+          { attempts: 1, timeoutMs: HISTORY_REQUEST_BUDGET_MS },
+        ),
+        normalizeCodexTokenActivity,
+        secret,
+      );
+    }
+    if (secret.kind !== "api-key") throw new Error("API key is missing");
+    const host = zhipuHost(plan);
+    return optionalTokenActivity(
+      fetchJson(
+        zhipuTokenActivityUrl(host),
+        {
+          Authorization: secret.apiKey,
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          Accept: "application/json",
+        },
+        ["open.bigmodel.cn", "dev.bigmodel.cn", "api.z.ai"],
+        deadline,
+        dispatcher,
+        { attempts: 1, timeoutMs: HISTORY_REQUEST_BUDGET_MS },
+      ),
+      normalizeZhipuTokenActivity,
+      secret,
+    );
+  } catch (error) {
+    return { tokenActivityStale: true, tokenActivityError: safeError(error, secret) };
+  }
+}
+
+function safeError(error: unknown, secret?: PlanSecret): string {
+  let message = error instanceof Error ? error.message : "Usage refresh failed";
+  let sensitiveValues: string[] = [];
+  if (secret?.kind === "api-key") {
+    sensitiveValues = secret.apiKey ? [secret.apiKey] : [];
+  } else if (secret?.kind === "codex-auth") {
+    const tokens = secret.auth.tokens;
+    if (isObject(tokens)) {
+      sensitiveValues = ["access_token", "refresh_token", "id_token"]
+        .map((key) => tokens[key])
+        .filter((value): value is string => typeof value === "string" && value.length > 0);
+    }
+  }
+  for (const value of sensitiveValues) message = message.split(value).join("[redacted]");
+  message = message.replace(/\bBearer\s+[^\s,;\])}]+/gi, "Bearer [redacted]");
+  if (/\bAuthorization\b/i.test(message)) return "Provider request failed";
+  return message.replace(/[\r\n]+/g, " ").slice(0, 300);
+}
+
+function mergeUsageHistory(
+  plan: Plan,
+  snapshot: UsageSnapshot,
+  previous?: UsageSnapshot,
+): UsageSnapshot {
+  let merged = snapshot;
+  if (!snapshot.tokenActivity && snapshot.tokenActivityError && previous?.tokenActivity) {
+    merged = {
+      ...snapshot,
+      tokenActivity: previous.tokenActivity,
+      tokenActivityStale: true,
+    };
+  }
+  if (plan.provider === "kimi") {
+    const fetchedAt = Date.parse(snapshot.fetchedAt);
+    return appendKimiQuotaHistory(
+      merged,
+      previous,
+      Number.isFinite(fetchedAt) ? fetchedAt : Date.now(),
+    );
+  }
+  return merged;
+}
+
+export async function cachedUsage(store: PlanStore = planStore): Promise<UsageSnapshot[]> {
+  const cache = await store.readUsageCache();
+  const staleBefore = Date.now() - 90_000;
+  return cache.map((snapshot) => ({
+    ...snapshot,
+    stale: Date.parse(snapshot.fetchedAt) < staleBefore,
+  }));
+}
+
+export async function refreshUsageSnapshots(
+  planId?: string,
+  store: PlanStore = planStore,
+): Promise<UsageSnapshot[]> {
+  const deadline = Date.now() + REFRESH_BUDGET_MS;
+  const snapshots = await beforeRefreshDeadline(() => store.snapshotPlans(planId), deadline);
+  const plans = snapshots.map((snapshot) => snapshot.plan);
+  const previous = await beforeRefreshDeadline(() => store.readUsageCache(), deadline);
+  const previousByPlan = new Map(previous.map((snapshot) => [snapshot.planId, snapshot]));
+
+  const results = new Array<UsageSnapshot>(snapshots.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(4, snapshots.length) }, async () => {
+    while (cursor < snapshots.length) {
+      const index = cursor;
+      cursor += 1;
+      const snapshot = snapshots[index];
+      const plan = snapshot.plan;
+      try {
+        if ("secretError" in snapshot) throw snapshot.secretError;
+        results[index] = await fetchPlanUsage(plan, snapshot.secret, deadline);
+      } catch (error) {
+        const cached = previousByPlan.get(plan.id);
+        const secret = "secret" in snapshot ? snapshot.secret : undefined;
+        if (cached) {
+          results[index] = { ...cached, status: "error", stale: true, error: safeError(error, secret) };
+          continue;
+        }
+        results[index] = {
+          planId: plan.id,
+          status: "error",
+          stale: true,
+          fetchedAt: new Date().toISOString(),
+          windows: [],
+          error: safeError(error, secret),
+        };
+      }
+    }
+  });
+  await Promise.all(workers);
+
+  if (Date.now() >= deadline) throw new Error("Usage refresh deadline exceeded");
+
+  const historyIndexes = snapshots
+    .map((snapshot, index) => ({ snapshot, index }))
+    .filter(({ snapshot, index }) => (
+      "secret" in snapshot &&
+      snapshot.plan.provider !== "kimi" &&
+      results[index]?.status === "ok"
+    ));
+  const historyDeadline = Math.min(deadline, Date.now() + HISTORY_REQUEST_BUDGET_MS);
+  let historyCursor = 0;
+  const historyWorkers = Array.from({ length: Math.min(4, historyIndexes.length) }, async () => {
+    while (historyCursor < historyIndexes.length) {
+      const cursorIndex = historyCursor;
+      historyCursor += 1;
+      const { snapshot, index } = historyIndexes[cursorIndex];
+      if (!("secret" in snapshot)) continue;
+      const activity = await fetchPlanTokenActivity(snapshot.plan, snapshot.secret, historyDeadline);
+      if (activity) results[index] = { ...results[index], ...activity };
+    }
+  });
+  await Promise.all(historyWorkers);
+
+  results.forEach((result, index) => {
+    if (result.status !== "ok") return;
+    const plan = snapshots[index].plan;
+    results[index] = mergeUsageHistory(plan, result, previousByPlan.get(plan.id));
+  });
+
+  if (deadline - Date.now() < MIN_CACHE_WRITE_BUDGET_MS) {
+    throw new Error("Usage refresh deadline exceeded");
+  }
+
+  const startedPlans = new Map(plans.map((plan) => [plan.id, plan.updatedAt]));
+  const successful = results.filter((snapshot) => snapshot.status === "ok");
+  const currentPlanIds = await store.mergeUsageCache(successful, startedPlans);
+  if (Date.now() >= deadline) {
+    return results.filter((snapshot) => currentPlanIds.has(snapshot.planId));
+  }
+  const cachedByPlan = new Map((await store.readUsageCache()).map((snapshot) => [snapshot.planId, snapshot]));
+  return results
+    .filter((snapshot) => currentPlanIds.has(snapshot.planId))
+    .map((snapshot) => snapshot.status === "ok" ? cachedByPlan.get(snapshot.planId) ?? snapshot : snapshot);
+}

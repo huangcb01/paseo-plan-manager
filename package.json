@@ -1,0 +1,30 @@
+{
+  "name": "paseo-coding-plan-manager",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Manage and switch Codex, Zhipu GLM, and Kimi coding plans from Paseo.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "smol-toml": "^1.8.0",
+    "undici": "^6.28.0"
+  },
+  "devDependencies": {
+    "@getpaseo/client": "0.5.1",
+    "@tanstack/react-query": "^5.90.11",
+    "@types/node": "^20.17.0",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
