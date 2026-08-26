@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { PlanStore } from "../store.server";
 import {
   appendKimiQuotaHistory,
   normalizeCodexUsage,
@@ -7,6 +11,7 @@ import {
   normalizeKimiUsage,
   normalizeZhipuTokenActivity,
   normalizeZhipuUsage,
+  refreshUsageSnapshots,
 } from "../usage.server";
 
 test("normalizes Codex primary, secondary, and additional windows", () => {
@@ -50,6 +55,55 @@ test("normalizes Codex primary, secondary, and additional windows", () => {
   assert.equal(result.windows[1].usedPercent, 61.5);
   assert.match(result.windows[2].label, /Codex Spark/);
   assert.equal(result.windows[0].resetAt, "2027-01-15T08:00:00.000Z");
+});
+
+test("normalizes Codex individual spend controls and reached-only responses", () => {
+  const result = normalizeCodexUsage(
+    {
+      plan_type: "business",
+      spend_control: {
+        reached: false,
+        individual_limit: {
+          limit: "11450",
+          used: "4522.35",
+          remaining: "6927.65",
+          used_percent: 39,
+          reset_at: 1_800_000_000,
+        },
+      },
+    },
+    "codex-business",
+  );
+
+  assert.deepEqual(result.windows, [{
+    id: "spend-control",
+    label: "个人额度",
+    usedPercent: 39,
+    used: "4522.35",
+    limit: "11450",
+    remaining: "6927.65",
+    resetAt: "2027-01-15T08:00:00.000Z",
+  }]);
+
+  const reached = normalizeCodexUsage(
+    { spendControl: { reached: true, individualLimit: null } },
+    "codex-reached",
+  );
+  assert.deepEqual(reached.windows, [{
+    id: "spend-control",
+    label: "个人额度",
+    usedPercent: 100,
+  }]);
+
+  const scalarLimit = normalizeCodexUsage(
+    { plan_type: "business", spend_control: { reached: false, individual_limit: "50" } },
+    "codex-scalar-limit",
+  );
+  assert.deepEqual(scalarLimit.windows, [{
+    id: "spend-control",
+    label: "个人额度",
+    limit: "50",
+  }]);
 });
 
 test("normalizes both GLM token windows and MCP quota", () => {
@@ -291,4 +345,84 @@ test("uses stable Kimi rate-window IDs and ignores small reset-time jitter", () 
   }, "kimi-stable");
   const next = appendKimiQuotaHistory(jittered, initial, start + 5 * 60_000);
   assert.equal(next.quotaHistory?.points[1].windows[0].reset, undefined);
+});
+
+test("enforces the refresh deadline before snapshot work", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-refresh-deadline-"));
+  try {
+    const store = new PlanStore(root);
+    const plan = await store.savePlan({
+      label: "Deadline",
+      provider: "kimi",
+      apiKey: "valid-request-value",
+    });
+    let first = true;
+    context.mock.method(Date, "now", () => {
+      if (first) {
+        first = false;
+        return 0;
+      }
+      return 29_000;
+    });
+
+    await assert.rejects(
+      refreshUsageSnapshots(plan.id, store),
+      /Usage refresh deadline exceeded/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects deadline results before returning unvalidated Plan revisions", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-refresh-revision-deadline-"));
+  try {
+    const store = new PlanStore(root);
+    const plan = await store.savePlan({
+      label: "Deadline revision",
+      provider: "kimi",
+      apiKey: "credential-before-corruption",
+    });
+    await writeFile(path.join(root, "secrets", `${plan.id}.json`), "{not-json\n");
+    const times = [0, 0, 0, 24_000];
+    context.mock.method(Date, "now", () => times.shift() ?? 24_000);
+
+    await assert.rejects(
+      refreshUsageSnapshots(plan.id, store),
+      /Usage refresh deadline exceeded/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("isolates broken secrets and redacts CR/LF request failures", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-header-safety-"));
+  try {
+    const store = new PlanStore(root);
+    const damaged = await store.savePlan({
+      label: "Damaged credential",
+      provider: "kimi",
+      apiKey: "damaged-before-corruption",
+    });
+    await writeFile(path.join(root, "secrets", `${damaged.id}.json`), "{not-json\n");
+    const secret = "safe-prefix\r\nAuthorization: Bearer leaked-secret";
+    const plan = await store.savePlan({
+      label: "Invalid header",
+      provider: "kimi",
+      apiKey: secret,
+    });
+
+    const results = await refreshUsageSnapshots(undefined, store);
+    const damagedResult = results.find((result) => result.planId === damaged.id);
+    const result = results.find((candidate) => candidate.planId === plan.id);
+    assert.equal(damagedResult?.status, "error");
+    assert.match(damagedResult?.error ?? "", /not valid JSON/);
+    assert.ok(result);
+    assert.equal(result.status, "error");
+    assert.equal(result.error, "Provider credential contains invalid line breaks");
+    assert.doesNotMatch(result.error ?? "", /safe-prefix|leaked-secret|Authorization|Bearer/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

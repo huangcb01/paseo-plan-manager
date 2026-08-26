@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DEFAULT_MAX_FILE_BYTES } from "../file-utils.server";
 import type { ActiveTargets, Plan, Provider, Target, UsageSnapshot } from "../plans.shared";
 import { PlanStore } from "../store.server";
 
@@ -352,6 +353,116 @@ test("cache merges do not roll provider activity or local samples backward", asy
       merged.quotaHistory?.points.map((point) => point.sampledAt),
       [firstAt, secondAt],
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("usage cache recovers from oversized files and bounds retained history", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-cache-limit-"));
+  try {
+    const store = new PlanStore(root);
+    const usagePath = path.join(root, "usage-cache.json");
+    await writeFile(usagePath, Buffer.alloc(DEFAULT_MAX_FILE_BYTES + 1, 0x20));
+    assert.deepEqual(await store.readUsageCache(), []);
+
+    const start = Date.parse("2026-01-01T00:00:00.000Z");
+    const usage: UsageSnapshot[] = Array.from({ length: 3 }, (_, planIndex) => {
+      const points = Array.from({ length: 2_017 }, (_, index) => ({
+        sampledAt: new Date(start + index * 5 * 60_000).toISOString(),
+        windows: [
+          { id: "5h", label: "5 小时", usedPercent: index % 101 },
+          { id: "weekly", label: "每周", usedPercent: (index + planIndex) % 101 },
+        ],
+      }));
+      return {
+        planId: `large-history-${planIndex}`,
+        status: "ok",
+        stale: false,
+        fetchedAt: points[points.length - 1].sampledAt,
+        windows: [],
+        quotaHistory: {
+          source: "local",
+          intervalSeconds: 300,
+          points,
+        },
+      };
+    });
+    assert.ok(Buffer.byteLength(`${JSON.stringify(usage, null, 2)}\n`) > DEFAULT_MAX_FILE_BYTES);
+
+    await store.writeUsageCache(usage);
+    assert.ok((await stat(usagePath)).size <= DEFAULT_MAX_FILE_BYTES);
+    const cached = await store.readUsageCache();
+    assert.equal(cached.length, usage.length);
+    cached.forEach((snapshot, index) => {
+      assert.ok((snapshot.quotaHistory?.points.length ?? 0) < 2_017);
+      assert.equal(
+        snapshot.quotaHistory?.points.at(-1)?.sampledAt,
+        usage[index].quotaHistory?.points.at(-1)?.sampledAt,
+      );
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("snapshotPlans isolates a damaged credential from healthy Plans", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-snapshot-isolation-"));
+  try {
+    const store = new PlanStore(root);
+    const damaged = await saveProviderPlan(store, "kimi", "Damaged");
+    const healthy = await saveProviderPlan(store, "zhipu", "Healthy");
+    await writeFile(path.join(root, "secrets", `${damaged.id}.json`), "{not-json\n");
+
+    const snapshots = await store.snapshotPlans();
+    const damagedSnapshot = snapshots.find((snapshot) => snapshot.plan.id === damaged.id);
+    const healthySnapshot = snapshots.find((snapshot) => snapshot.plan.id === healthy.id);
+    assert.ok(damagedSnapshot && "secretError" in damagedSnapshot);
+    assert.ok(healthySnapshot && "secret" in healthySnapshot);
+    if (healthySnapshot && "secret" in healthySnapshot) {
+      assert.deepEqual(healthySnapshot.secret, { kind: "api-key", apiKey: "Healthy-secret" });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("usage cache bounds non-Kimi history and drops an individually oversized snapshot", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-cache-fallbacks-"));
+  try {
+    const store = new PlanStore(root);
+    const tokenPoints = Array.from({ length: 40_000 }, (_, index) => ({
+      date: "2026-01-01",
+      tokens: index,
+      calls: index,
+    }));
+    const tokenHeavy: UsageSnapshot = {
+      planId: "token-heavy",
+      status: "ok",
+      stale: false,
+      fetchedAt: "2026-01-01T00:00:00.000Z",
+      windows: [],
+      tokenActivity: {
+        source: "provider",
+        granularity: "day",
+        points: tokenPoints,
+      },
+    };
+
+    await store.writeUsageCache([tokenHeavy]);
+    const [cached] = await store.readUsageCache();
+    assert.ok((cached.tokenActivity?.points.length ?? 0) < tokenPoints.length);
+    assert.equal(cached.tokenActivity?.points.at(-1)?.tokens, tokenPoints.at(-1)?.tokens);
+
+    const oversized: UsageSnapshot = {
+      planId: "oversized-current-window",
+      status: "ok",
+      stale: false,
+      fetchedAt: "2026-01-01T00:00:00.000Z",
+      windows: [{ id: "large", label: "x".repeat(DEFAULT_MAX_FILE_BYTES), usedPercent: 1 }],
+    };
+    await store.writeUsageCache([oversized]);
+    assert.deepEqual(await store.readUsageCache(), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

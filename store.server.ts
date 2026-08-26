@@ -14,8 +14,10 @@ import type {
 import {
   atomicWriteFile,
   captureFile,
+  DEFAULT_MAX_FILE_BYTES,
   ensurePrivateDirectory,
   expandHome,
+  FileTooLargeError,
   parseJsonObject,
   paseoCodingPlanHome,
   readTextIfExists,
@@ -55,10 +57,9 @@ function serializeSecret(secret: PlanSecret): string {
   return text;
 }
 
-export interface PlanSnapshot {
-  plan: Plan;
-  secret: PlanSecret;
-}
+export type PlanSnapshot =
+  | { plan: Plan; secret: PlanSecret }
+  | { plan: Plan; secretError: unknown };
 
 const PROVIDERS = ["codex", "zhipu", "kimi"] as const satisfies readonly Provider[];
 
@@ -387,6 +388,60 @@ function mergeCachedUsage(current: UsageSnapshot | undefined, incoming: UsageSna
     }
   }
   return merged;
+}
+
+function serializeUsageCache(usage: UsageSnapshot[]): string {
+  let bounded = usage;
+  let text = `${JSON.stringify(bounded, null, 2)}\n`;
+  while (Buffer.byteLength(text, "utf8") > DEFAULT_MAX_FILE_BYTES) {
+    const longestQuotaHistory = bounded.reduce(
+      (longest, snapshot) => Math.max(longest, snapshot.quotaHistory?.points.length ?? 0),
+      0,
+    );
+    if (longestQuotaHistory > 0) {
+      const nextLimit = Math.floor(longestQuotaHistory / 2);
+      bounded = bounded.map((snapshot) => {
+        if (!snapshot.quotaHistory || snapshot.quotaHistory.points.length <= nextLimit) return snapshot;
+        if (nextLimit === 0) {
+          const { quotaHistory: _quotaHistory, ...withoutHistory } = snapshot;
+          return withoutHistory;
+        }
+        return {
+          ...snapshot,
+          quotaHistory: {
+            ...snapshot.quotaHistory,
+            points: snapshot.quotaHistory.points.slice(-nextLimit),
+          },
+        };
+      });
+    } else {
+      const longestTokenActivity = bounded.reduce(
+        (longest, snapshot) => Math.max(longest, snapshot.tokenActivity?.points.length ?? 0),
+        0,
+      );
+      if (longestTokenActivity > 0) {
+        const nextLimit = Math.floor(longestTokenActivity / 2);
+        bounded = bounded.map((snapshot) => {
+          if (!snapshot.tokenActivity || snapshot.tokenActivity.points.length <= nextLimit) return snapshot;
+          if (nextLimit === 0) {
+            const { tokenActivity: _tokenActivity, ...withoutActivity } = snapshot;
+            return withoutActivity;
+          }
+          return {
+            ...snapshot,
+            tokenActivity: {
+              ...snapshot.tokenActivity,
+              points: snapshot.tokenActivity.points.slice(-nextLimit),
+            },
+          };
+        });
+      } else {
+        bounded = bounded.slice(Math.max(1, Math.ceil(bounded.length / 2)));
+      }
+    }
+    text = `${JSON.stringify(bounded, null, 2)}\n`;
+  }
+  return text;
 }
 
 export class PlanStore {
@@ -835,7 +890,13 @@ export class PlanStore {
   }
 
   async readUsageCache(): Promise<UsageSnapshot[]> {
-    const text = await readTextIfExists(this.usagePath);
+    let text: string | undefined;
+    try {
+      text = await readTextIfExists(this.usagePath);
+    } catch (error) {
+      if (error instanceof FileTooLargeError) return [];
+      throw error;
+    }
     if (!text) return [];
     const parsed: unknown = JSON.parse(text);
     if (!Array.isArray(parsed) || !parsed.every(validateUsage)) {
@@ -846,7 +907,7 @@ export class PlanStore {
 
   async writeUsageCache(usage: UsageSnapshot[]): Promise<void> {
     await this.initialize();
-    await atomicWriteFile(this.usagePath, `${JSON.stringify(usage, null, 2)}\n`, 0o600);
+    await atomicWriteFile(this.usagePath, serializeUsageCache(usage), 0o600);
   }
 
   async mergeUsageCache(
@@ -883,12 +944,17 @@ export class PlanStore {
       if (planId && plans.length === 0) throw new Error("Coding Plan not found");
       const snapshots: PlanSnapshot[] = [];
       for (const plan of plans) {
-        let secret = await this.readSecretFile(plan.id);
-        if (plan.provider === "codex") {
-          if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
-          secret = await this.syncCodexSource(plan, secret);
+        const clonedPlan = structuredClone(plan);
+        try {
+          let secret = await this.readSecretFile(plan.id);
+          if (plan.provider === "codex") {
+            if (secret.kind !== "codex-auth") throw new Error("Codex credential is missing");
+            secret = await this.syncCodexSource(plan, secret);
+          }
+          snapshots.push({ plan: clonedPlan, secret: structuredClone(secret) });
+        } catch (secretError) {
+          snapshots.push({ plan: clonedPlan, secretError });
         }
-        snapshots.push({ plan: structuredClone(plan), secret: structuredClone(secret) });
       }
       return snapshots.sort((left, right) => left.plan.createdAt.localeCompare(right.plan.createdAt));
     });

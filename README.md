@@ -102,7 +102,7 @@ Codex 当前额度仍来自 `/backend-api/wham/usage`；按日 Token 活动来�
 - 凭据：`$XDG_DATA_HOME/opencode/auth.json`，否则 `~/.local/share/opencode/auth.json`。
 - 已存在 `opencode.jsonc` 时优先修改它，否则使用 `opencode.json`。
 
-智谱和 Kimi 会把本次所选模型全部写入 `provider.zhipu.models` 或 `provider.kimi.models`，并以首个模型更新顶层 `model`；Codex OAuth 只更新顶层默认模型，不改 OpenCode 内置 OpenAI 模型目录。插件还会更新对应 auth 条目，其他 provider、插件、MCP、skills 及 JSONC 注释会保留。若设置了 `OPENCODE_CONFIG_CONTENT` 或 `OPENCODE_AUTH_CONTENT`，文件修改不会生效，因此插件会拒绝操作。
+智谱和 Kimi 会把本次所选模型及其 context/output、输入输出模态、推理、附件、工具调用和 temperature 能力写入 `provider.zhipu.models` 或 `provider.kimi.models`；GLM 还会写入 `reasoning_content` interleaved 协议字段。首个模型用于更新顶层 `model`；未知自定义模型已有的能力声明不会被覆盖。插件只更新该 provider 中由自身管理的连接和模型字段，保留用户的 timeout、headers、其他模型及 JSONC 注释。Codex OAuth 只更新顶层默认模型，不改 OpenCode 内置 OpenAI 模型目录。插件还会更新对应 auth 条目，其他 provider、插件、MCP 和 skills 会保留。若设置了 `OPENCODE_CONFIG_CONTENT` 或 `OPENCODE_AUTH_CONTENT`，文件修改不会生效，因此插件会拒绝操作。
 
 OpenCode 的 Active 状态按 provider 分槽保存：Codex、智谱和 Kimi 各自最多保留一个 Plan，因此三个 provider 的凭据和目录状态可以同时共存；再次应用同一 provider 的 Plan 只替换该 provider 的记录。不过 OpenCode 顶层 `model` 始终只有一个，最近一次成功应用的 Plan 首个模型是当前默认。Codex 和 Claude Code 的 Active 状态仍各自是单例，后一次成功应用会替换该目标先前的 Plan。
 
@@ -125,7 +125,7 @@ Codex OAuth 切换只支持 `cli_auth_credentials_store = "file"` 或未显式�
 
 ### Claude Code
 
-路径为 `$CLAUDE_CONFIG_DIR/settings.json` 或 `~/.claude/settings.json`。插件以首个所选模型设置 `env` 中的默认模型，并把全部所选模型合并到用户 `modelPicker.options`；已有 picker 选项和 `replaceBuiltInOptions` 会保留。多模型候选需要 Claude Code 2.1.242 或更高版本。插件同时保留 permissions、hooks、plugins 及其他环境变量，并合并对应 profile 的 onboarding 状态：默认是 `~/.claude.json`；设置 `CLAUDE_CONFIG_DIR` 时使用该目录内已有的 `.config.json`，否则使用 `.claude.json`。Kimi 额外设置官方要求的 `penguinModeOrgEnabled`。Kimi 使用 `ANTHROPIC_API_KEY`，并同时设置 Fable、Haiku、Sonnet、Opus、subagent 和 effort 变量；智谱使用 `ANTHROPIC_AUTH_TOKEN`。只有全部所选 Kimi 模型均为 `k3` / `k3[1m]` 时才启用 1,048,576 context window，混合列表回退到 262,144。
+路径为 `$CLAUDE_CONFIG_DIR/settings.json` 或 `~/.claude/settings.json`。插件以首个所选模型设置 `env` 中的默认模型，并替换自身标记的 `modelPicker.options`；真正的用户选项和 `replaceBuiltInOptions` 会保留，因此切换 Kimi/智谱或重新选择模型时不会留下不可用的旧 provider 项。多模型候选需要 Claude Code 2.1.242 或更高版本。插件同时保留 permissions、hooks、plugins 及其他环境变量，并合并对应 profile 的 onboarding 状态：默认是 `~/.claude.json`；设置 `CLAUDE_CONFIG_DIR` 时使用该目录内已有的 `.config.json`，否则使用 `.claude.json`。Kimi 额外设置官方要求的 `penguinModeOrgEnabled`。Kimi 使用 `ANTHROPIC_API_KEY`，并同时设置 Fable、Haiku、Sonnet、Opus、subagent 和 effort 变量；智谱使用 `ANTHROPIC_AUTH_TOKEN`。只有全部所选 Kimi 模型均为 `k3` / `k3[1m]` 时才启用 1,048,576 context window，混合列表回退到 262,144。
 
 ChatGPT Codex 后端是 OpenAI Responses 协议，Claude Code 发出 Anthropic Messages 协议，二者不能只靠环境变量直连。该组合会明确返回“未写入”，不会制造表面成功。
 
@@ -153,6 +153,7 @@ secrets/<plan>.json # OAuth / API Key
 - API Key 或直接粘贴的 Codex `auth.json` 在表单中输入时存在于当前 Paseo 客户端内存，并通过现有的 Paseo RPC 连接提交一次；保存后 daemon RPC 不再返回明文凭据。日志中也不输出 token、Key、响应正文或 Authorization header。
 - 用量请求只允许预定义的精确 HTTPS hostname，禁用跨域 redirect，并限制响应体大小。
 - 成功快照会持久化；网络失败时界面显示旧数据和 `STALE`，不会把未知值伪装成 0。
+- `usage-cache.json` 写入前硬限制为 2 MiB，依次裁剪最旧的本地配额历史、Token 活动和超大快照；旧版本留下的超限文件会被当作空缓存恢复，不会阻塞 dashboard、刷新或删除操作。
 - `plans.json` 当前版本为 v4。有效的 v1/v2/v3 数据会在首次读取时直接升级到 v4：移除早期 Plan 中的目标模型字段，补充 Plan 级网络代理开关，并把 Active 状态校验到现有 Plan。v3 只记录了一个 OpenCode Plan，因此迁移只能依据该 Plan 元数据中的精确 provider 恢复对应的一个 provider 槽，无法恢复当时未记录的其他 OpenCode provider；不会根据 Plan ID 猜测 provider。Codex 和 Claude Code 仍分别迁移其单例引用。
 
 配置写入采用同目录临时文件、`fsync` 和 rename。涉及 auth + config 两个文件时先写 auth，第二步失败会恢复 auth 快照；这能做到崩溃恢复友好，但操作系统不支持跨两个文件的全局原子事务。切换后建议新建 CLI 会话。

@@ -69,6 +69,128 @@ interface ProviderProjection {
   };
 }
 
+type ApiKeyProvider = Exclude<Plan["provider"], "codex">;
+type OpenCodeInputModality = "text" | "image" | "video" | "pdf";
+
+interface ModelCapabilities {
+  context: number;
+  output: number;
+  input: readonly OpenCodeInputModality[];
+  attachment: boolean;
+  temperature: boolean;
+  interleaved?: "reasoning_content";
+}
+
+// OpenCode consumes these records from models.dev for its built-in model catalog.
+const DEFAULT_MODEL_CAPABILITIES: Record<ApiKeyProvider, ModelCapabilities> = {
+  zhipu: {
+    context: 204_800,
+    output: 131_072,
+    input: ["text"],
+    attachment: false,
+    temperature: true,
+    interleaved: "reasoning_content",
+  },
+  kimi: { context: 262_144, output: 32_768, input: ["text"], attachment: false, temperature: false },
+};
+
+const MODEL_CAPABILITIES: Record<ApiKeyProvider, Record<string, ModelCapabilities>> = {
+  zhipu: {
+    "glm-5.1": {
+      context: 200_000,
+      output: 131_072,
+      input: ["text"],
+      attachment: false,
+      temperature: true,
+      interleaved: "reasoning_content",
+    },
+    "glm-5.3": {
+      context: 1_000_000,
+      output: 131_072,
+      input: ["text"],
+      attachment: false,
+      temperature: true,
+      interleaved: "reasoning_content",
+    },
+    "glm-5-turbo": {
+      context: 200_000,
+      output: 131_072,
+      input: ["text"],
+      attachment: false,
+      temperature: true,
+      interleaved: "reasoning_content",
+    },
+    "glm-4.7": {
+      context: 204_800,
+      output: 131_072,
+      input: ["text"],
+      attachment: false,
+      temperature: true,
+      interleaved: "reasoning_content",
+    },
+  },
+  kimi: {
+    "kimi-for-coding": {
+      context: 262_144,
+      output: 32_768,
+      input: ["text", "image", "video"],
+      attachment: true,
+      temperature: false,
+    },
+    "kimi-for-coding-highspeed": {
+      context: 262_144,
+      output: 32_768,
+      input: ["text", "image", "video"],
+      attachment: true,
+      temperature: false,
+    },
+    k3: {
+      context: 1_048_576,
+      output: 131_072,
+      input: ["text", "image", "video"],
+      attachment: false,
+      temperature: false,
+    },
+    "k3-256k": {
+      context: 262_144,
+      output: 131_072,
+      input: ["text", "image"],
+      attachment: false,
+      temperature: false,
+    },
+  },
+};
+
+function canonicalPlanModel(provider: ApiKeyProvider, model: string): string {
+  const withoutContextSuffix = model.endsWith("[1m]") ? model.slice(0, -4) : model;
+  return Object.hasOwn(MODEL_CAPABILITIES[provider], withoutContextSuffix)
+    ? withoutContextSuffix
+    : model;
+}
+
+function isKnownPlanModel(provider: ApiKeyProvider, model: string): boolean {
+  return Object.hasOwn(MODEL_CAPABILITIES[provider], canonicalPlanModel(provider, model));
+}
+
+function openCodeModelDefinition(provider: ApiKeyProvider, model: string): Record<string, unknown> {
+  const canonical = canonicalPlanModel(provider, model);
+  const capabilities = Object.hasOwn(MODEL_CAPABILITIES[provider], canonical)
+    ? MODEL_CAPABILITIES[provider][canonical]
+    : DEFAULT_MODEL_CAPABILITIES[provider];
+  return {
+    name: model,
+    limit: { context: capabilities.context, output: capabilities.output },
+    modalities: { input: [...capabilities.input], output: ["text"] },
+    reasoning: true,
+    attachment: capabilities.attachment,
+    tool_call: true,
+    temperature: capabilities.temperature,
+    ...(capabilities.interleaved
+      ? { interleaved: { field: capabilities.interleaved } }
+      : {}),
+  };
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -184,19 +306,58 @@ export function patchOpenCodeConfig(text: string | undefined, plan: Plan, select
   }
 
   const projection = providerProjection(plan);
-  const providerConfig = {
-    npm: projection.opencode.npm,
-    name: projection.displayName,
-    options: {
-      baseURL: projection.opencode.baseUrl,
-      setCacheKey: true,
-    },
-    models: Object.fromEntries(models.map((candidate) => [candidate, { name: candidate }])),
-  };
-  return editJsonc(source, [
-    { path: ["provider", projection.providerId], value: providerConfig },
-    { path: ["model"], value: `${projection.providerId}/${model}` },
-  ]);
+  const providers = isObject(parsed.provider) ? parsed.provider : {};
+  const existingProvider = providers[projection.providerId];
+  if (existingProvider !== undefined && !isObject(existingProvider)) {
+    throw new Error(`OpenCode config.provider.${projection.providerId} must be an object`);
+  }
+  if (isObject(existingProvider) && existingProvider.options !== undefined && !isObject(existingProvider.options)) {
+    throw new Error(`OpenCode config.provider.${projection.providerId}.options must be an object`);
+  }
+  if (isObject(existingProvider) && existingProvider.models !== undefined && !isObject(existingProvider.models)) {
+    throw new Error(`OpenCode config.provider.${projection.providerId}.models must be an object`);
+  }
+  const existingModels = isObject(existingProvider) && isObject(existingProvider.models)
+    ? existingProvider.models
+    : {};
+  for (const candidate of models) {
+    const existingModel = Object.hasOwn(existingModels, candidate) ? existingModels[candidate] : undefined;
+    if (existingModel !== undefined && !isObject(existingModel)) {
+      throw new Error(`OpenCode config.provider.${projection.providerId}.models.${candidate} must be an object`);
+    }
+  }
+
+  const changes: Array<{ path: (string | number)[]; value: unknown }> = [
+    { path: ["provider", projection.providerId, "npm"], value: projection.opencode.npm },
+    { path: ["provider", projection.providerId, "name"], value: projection.displayName },
+    { path: ["provider", projection.providerId, "options", "baseURL"], value: projection.opencode.baseUrl },
+    { path: ["provider", projection.providerId, "options", "setCacheKey"], value: true },
+    { path: ["provider", projection.providerId, "options", "apiKey"], value: undefined },
+  ];
+  for (const candidate of models) {
+    const existingModel = isObject(existingModels[candidate]) ? existingModels[candidate] : undefined;
+    const knownModel = isKnownPlanModel(plan.provider, candidate);
+    for (const [field, value] of Object.entries(openCodeModelDefinition(plan.provider, candidate))) {
+      if (!knownModel && existingModel && Object.hasOwn(existingModel, field)) continue;
+      if (
+        knownModel &&
+        (field === "limit" || field === "modalities") &&
+        isObject(value) &&
+        isObject(existingModel?.[field])
+      ) {
+        for (const [nestedField, nestedValue] of Object.entries(value)) {
+          changes.push({
+            path: ["provider", projection.providerId, "models", candidate, field, nestedField],
+            value: nestedValue,
+          });
+        }
+        continue;
+      }
+      changes.push({ path: ["provider", projection.providerId, "models", candidate, field], value });
+    }
+  }
+  changes.push({ path: ["model"], value: `${projection.providerId}/${model}` });
+  return editJsonc(source, changes);
 }
 
 function accessTokenExpiry(auth: Record<string, unknown>): number {
@@ -318,6 +479,17 @@ export function patchOpenCodeAuth(
 
 const MANAGED_TOML_START = "# BEGIN paseo-coding-plan-manager";
 const MANAGED_TOML_END = "# END paseo-coding-plan-manager";
+const CODEX_MODEL_CATALOG_FILENAME = "paseo-coding-plan-models.json";
+
+function isManagedCodexModelCatalog(value: unknown, expectedPath: string | undefined): boolean {
+  if (typeof value !== "string" || expectedPath === undefined) return false;
+  const configuredPath = value === "~" || value.startsWith("~/") || value.startsWith("~\\")
+    ? expandHome(value)
+    : path.isAbsolute(value)
+      ? path.normalize(value)
+      : path.resolve(path.dirname(expectedPath), value);
+  return configuredPath === path.resolve(expectedPath);
+}
 
 function removeManagedToml(text: string): string {
   const startMatch = /^[\t ]*# BEGIN paseo-coding-plan-manager[\t ]*$/m.exec(text);
@@ -388,7 +560,7 @@ export function patchCodexConfig(
   options: { apiKey?: string; modelCatalogPath?: string } = {},
 ): string {
   const source = text ?? "";
-  tomlObject(source, "Codex config.toml");
+  const parsedSource = tomlObject(source, "Codex config.toml");
   if (source.includes('"""') || source.includes("'''")) {
     throw new Error("Codex config with multiline TOML strings cannot be safely patched");
   }
@@ -399,7 +571,9 @@ export function patchCodexConfig(
     const updated = upsertRootTomlKeys(result, {
       model_provider: "openai",
       model,
-      model_catalog_json: undefined,
+      ...(isManagedCodexModelCatalog(parsedSource.model_catalog_json, options.modelCatalogPath)
+        ? { model_catalog_json: undefined }
+        : {}),
     });
     tomlObject(updated, "Updated Codex config.toml");
     return updated;
@@ -434,6 +608,44 @@ export function patchCodexConfig(
   return updated;
 }
 
+const CLAUDE_PROJECTED_MODEL_FIELDS = [
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+] as const;
+const CLAUDE_MANAGED_MODEL_DESCRIPTION = "Managed by Paseo Coding Plan Manager";
+
+function claudeProjectedProvider(env: Record<string, unknown>): ApiKeyProvider | undefined {
+  const model = env.ANTHROPIC_MODEL;
+  if (typeof model !== "string" || !CLAUDE_PROJECTED_MODEL_FIELDS.every((field) => env[field] === model)) {
+    return undefined;
+  }
+  const baseUrl = env.ANTHROPIC_BASE_URL;
+  if (baseUrl === "https://api.kimi.com/coding/") return "kimi";
+  if (
+    baseUrl === "https://api.z.ai/api/anthropic" ||
+    baseUrl === "https://open.bigmodel.cn/api/anthropic" ||
+    baseUrl === "https://dev.bigmodel.cn/api/anthropic"
+  ) return "zhipu";
+  return undefined;
+}
+
+function isLegacyGeneratedClaudeOption(
+  option: Record<string, unknown>,
+  previousProvider: ApiKeyProvider,
+): boolean {
+  return Object.keys(option).length === 2 &&
+    option.label === option.model &&
+    typeof option.model === "string" &&
+    isKnownPlanModel(previousProvider, option.model);
+}
+
+function isManagedClaudeOption(option: Record<string, unknown>): boolean {
+  return option.description === CLAUDE_MANAGED_MODEL_DESCRIPTION;
+}
+
 export function patchClaudeSettings(
   text: string | undefined,
   plan: Plan,
@@ -451,6 +663,7 @@ export function patchClaudeSettings(
     throw new Error("Claude settings.json modelPicker must be an object");
   }
   const env = isObject(settings.env) ? { ...settings.env } : {};
+  const previousProvider = claudeProjectedProvider(env);
   const projection = providerProjection(plan);
   const models = normalizeModels(selectedModels, "Claude models");
   const model = models[0];
@@ -494,6 +707,9 @@ export function patchClaudeSettings(
     ) {
       throw new Error("Claude settings.json modelPicker.options entries must have compatible model, label, and description fields");
     }
+    if (isManagedClaudeOption(option) || (previousProvider && isLegacyGeneratedClaudeOption(option, previousProvider))) {
+      continue;
+    }
     if (!pickerModels.has(option.model)) {
       pickerModels.add(option.model);
       options.push(option);
@@ -502,7 +718,11 @@ export function patchClaudeSettings(
   for (const candidate of models) {
     if (!pickerModels.has(candidate)) {
       pickerModels.add(candidate);
-      options.push({ model: candidate, label: candidate });
+      options.push({
+        model: candidate,
+        label: candidate,
+        description: CLAUDE_MANAGED_MODEL_DESCRIPTION,
+      });
     }
   }
   settings.env = env;
@@ -743,7 +963,9 @@ async function applyCodex(
     const tokens = codexTokens(auth);
     if (plan.accountId) tokens.account_id = plan.accountId;
     const nextAuth = `${JSON.stringify(auth, null, 2)}\n`;
-    const nextConfig = patchCodexConfig(configText, plan, selectedModels);
+    const nextConfig = patchCodexConfig(configText, plan, selectedModels, {
+      modelCatalogPath: path.join(directory, CODEX_MODEL_CATALOG_FILENAME),
+    });
     if (!installed) warnings.push("未检测到 Codex；仅写入配置，没有安装 Codex。");
     await writePair(authPath, nextAuth, configPath, nextConfig, {
       expectedFirst: { text: currentAuthText },
@@ -774,7 +996,7 @@ async function applyCodex(
     };
   }
   if (secret.kind !== "api-key") throw new Error("API key is missing");
-  const catalogPath = path.join(directory, "paseo-coding-plan-models.json");
+  const catalogPath = path.join(directory, CODEX_MODEL_CATALOG_FILENAME);
   const nextConfig = patchCodexConfig(configText, plan, selectedModels, {
     apiKey: secret.apiKey,
     modelCatalogPath: catalogPath,

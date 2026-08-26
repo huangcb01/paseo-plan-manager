@@ -52,10 +52,130 @@ test("patches one multi-model OpenCode provider while preserving comments and un
   assert.equal(parsed.provider.kimi.options.baseURL, "https://api.kimi.com/coding/v1");
   assert.equal(parsed.provider.kimi.options.apiKey, undefined);
   assert.deepEqual(parsed.provider.kimi.models, {
-    "kimi-for-coding": { name: "kimi-for-coding" },
-    "kimi-latest": { name: "kimi-latest" },
+    "kimi-for-coding": {
+      name: "kimi-for-coding",
+      limit: { context: 262_144, output: 32_768 },
+      modalities: { input: ["text", "image", "video"], output: ["text"] },
+      reasoning: true,
+      attachment: true,
+      tool_call: true,
+      temperature: false,
+    },
+    "kimi-latest": {
+      name: "kimi-latest",
+      limit: { context: 262_144, output: 32_768 },
+      modalities: { input: ["text"], output: ["text"] },
+      reasoning: true,
+      attachment: false,
+      tool_call: true,
+      temperature: false,
+    },
   });
   assert.equal(parsed.model, "kimi/kimi-for-coding");
+});
+
+test("patches only managed fields inside an existing OpenCode provider", () => {
+  const source = `{
+  "provider": {
+    "kimi": {
+      // preserve this provider comment
+      "api": "https://user.example/v1",
+      "env": ["USER_KIMI_KEY"],
+      "options": { "timeout": 1234, "apiKey": "stale-inline-key" },
+      "models": {
+        "user-model": {
+          "name": "User model",
+          "headers": { "X-User": "keep" }
+        },
+        "kimi-for-coding": {
+          "name": "User label",
+          "limit": { "context": 1, "input": 999, "output": 2 },
+          "headers": { "X-Selected": "keep" },
+          "variants": { "fast": { "disabled": false } }
+        }
+      }
+    }
+  }
+}\n`;
+  const output = patchOpenCodeConfig(source, plan("kimi"), ["kimi-for-coding"]);
+  const parsed = parse(output) as Record<string, any>;
+
+  assert.match(output, /preserve this provider comment/);
+  assert.equal(parsed.provider.kimi.api, "https://user.example/v1");
+  assert.deepEqual(parsed.provider.kimi.env, ["USER_KIMI_KEY"]);
+  assert.equal(parsed.provider.kimi.options.timeout, 1234);
+  assert.equal(parsed.provider.kimi.options.apiKey, undefined);
+  assert.deepEqual(parsed.provider.kimi.models["user-model"], {
+    name: "User model",
+    headers: { "X-User": "keep" },
+  });
+  assert.deepEqual(parsed.provider.kimi.models["kimi-for-coding"].headers, { "X-Selected": "keep" });
+  assert.deepEqual(parsed.provider.kimi.models["kimi-for-coding"].variants, {
+    fast: { disabled: false },
+  });
+  assert.deepEqual(parsed.provider.kimi.models["kimi-for-coding"].limit, {
+    context: 262_144,
+    input: 999,
+    output: 32_768,
+  });
+  assert.equal(parsed.provider.kimi.models["kimi-for-coding"].name, "kimi-for-coding");
+});
+
+test("preserves capabilities already defined for a selected custom OpenCode model", () => {
+  const source = JSON.stringify({
+    provider: {
+      kimi: {
+        models: {
+          "private-model": {
+            name: "Private model",
+            limit: { context: 777_777, output: 12_345 },
+            modalities: { input: ["text", "pdf"], output: ["text"] },
+            reasoning: false,
+            attachment: true,
+            tool_call: false,
+            temperature: true,
+          },
+        },
+      },
+    },
+  });
+  const parsed = JSON.parse(patchOpenCodeConfig(source, plan("kimi"), ["private-model"]));
+
+  assert.deepEqual(parsed.provider.kimi.models["private-model"], {
+    name: "Private model",
+    limit: { context: 777_777, output: 12_345 },
+    modalities: { input: ["text", "pdf"], output: ["text"] },
+    reasoning: false,
+    attachment: true,
+    tool_call: false,
+    temperature: true,
+  });
+});
+
+test("writes model-specific OpenCode limits and modalities", () => {
+  const kimi = JSON.parse(patchOpenCodeConfig(undefined, plan("kimi"), ["k3", "k3-256k"]));
+  assert.deepEqual(kimi.provider.kimi.models.k3.limit, { context: 1_048_576, output: 131_072 });
+  assert.deepEqual(kimi.provider.kimi.models.k3.modalities.input, ["text", "image", "video"]);
+  assert.equal(kimi.provider.kimi.models.k3.attachment, false);
+  assert.equal(kimi.provider.kimi.models.k3.tool_call, true);
+  assert.equal(kimi.provider.kimi.models.k3.temperature, false);
+
+  const zhipu = JSON.parse(patchOpenCodeConfig(undefined, plan("zhipu"), ["glm-5.3"]));
+  assert.deepEqual(zhipu.provider.zhipu.models["glm-5.3"].limit, {
+    context: 1_000_000,
+    output: 131_072,
+  });
+  assert.deepEqual(zhipu.provider.zhipu.models["glm-5.3"].modalities, {
+    input: ["text"],
+    output: ["text"],
+  });
+  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].reasoning, true);
+  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].attachment, false);
+  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].tool_call, true);
+  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].temperature, true);
+  assert.deepEqual(zhipu.provider.zhipu.models["glm-5.3"].interleaved, {
+    field: "reasoning_content",
+  });
 });
 
 test("leaves the OpenCode built-in OpenAI catalog untouched for Codex OAuth", () => {
@@ -172,7 +292,11 @@ test("patches only Claude env and keeps unrelated settings", () => {
   assert.deepEqual(parsed.modelPicker.options, [
     { model: "existing-model", label: "Existing", description: "Keep this row" },
     { model: "kimi-for-coding", label: "User label" },
-    { model: "kimi-latest", label: "kimi-latest" },
+    {
+      model: "kimi-latest",
+      label: "kimi-latest",
+      description: "Managed by Paseo Coding Plan Manager",
+    },
   ]);
 });
 
@@ -181,6 +305,49 @@ test("uses the 1M Kimi context only when every selected model supports it", () =
   const mixed = JSON.parse(patchClaudeSettings(undefined, plan("kimi"), "secret", ["k3", "kimi-for-coding"]));
   assert.equal(allLarge.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1048576");
   assert.equal(mixed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "262144");
+});
+
+test("removes stale generated Claude models when switching providers", () => {
+  const initial = JSON.stringify({
+    modelPicker: {
+      replaceBuiltInOptions: true,
+      options: [
+        { model: "user-model", label: "User model", description: "Keep this row" },
+        { model: "glm-5.3", label: "Pinned GLM", description: "User-managed row" },
+      ],
+    },
+  });
+  const zhipu = patchClaudeSettings(initial, plan("zhipu"), "zhipu-secret", ["glm-5.1", "glm-4.7"]);
+  const kimi = JSON.parse(patchClaudeSettings(zhipu, plan("kimi"), "kimi-secret", [
+    "kimi-for-coding",
+    "k3",
+  ]));
+
+  assert.equal(kimi.modelPicker.replaceBuiltInOptions, true);
+  assert.deepEqual(kimi.modelPicker.options, [
+    { model: "user-model", label: "User model", description: "Keep this row" },
+    { model: "glm-5.3", label: "Pinned GLM", description: "User-managed row" },
+    {
+      model: "kimi-for-coding",
+      label: "kimi-for-coding",
+      description: "Managed by Paseo Coding Plan Manager",
+    },
+    { model: "k3", label: "k3", description: "Managed by Paseo Coding Plan Manager" },
+  ]);
+});
+
+test("replaces only marked Claude picker options on same-provider reapply", () => {
+  const source = patchClaudeSettings(undefined, plan("kimi"), "secret", [
+    "kimi-for-coding",
+    "k3",
+  ]);
+  const parsed = JSON.parse(patchClaudeSettings(source, plan("kimi"), "secret", ["k3-256k"]));
+
+  assert.deepEqual(parsed.modelPicker.options, [{
+    model: "k3-256k",
+    label: "k3-256k",
+    description: "Managed by Paseo Coding Plan Manager",
+  }]);
 });
 
 test("fails closed for incompatible Claude model picker settings", () => {
@@ -247,8 +414,16 @@ test("writes Claude onboarding state inside a custom CLAUDE_CONFIG_DIR profile",
     assert.equal(settings.env.ANTHROPIC_API_KEY, "kimi-secret");
     assert.equal(settings.env.ANTHROPIC_MODEL, "kimi-custom-model");
     assert.deepEqual(settings.modelPicker.options, [
-      { model: "kimi-custom-model", label: "kimi-custom-model" },
-      { model: "kimi-backup-model", label: "kimi-backup-model" },
+      {
+        model: "kimi-custom-model",
+        label: "kimi-custom-model",
+        description: "Managed by Paseo Coding Plan Manager",
+      },
+      {
+        model: "kimi-backup-model",
+        label: "kimi-backup-model",
+        description: "Managed by Paseo Coding Plan Manager",
+      },
     ]);
     assert.ok(result.warnings.some((warning) => warning.includes("2.1.242")));
   } finally {
@@ -262,11 +437,44 @@ test("removes the managed bearer token when switching Codex back to OAuth", () =
   const globalPlan = { ...plan("zhipu"), region: "global" as const };
   const thirdParty = patchCodexConfig(undefined, globalPlan, ["glm-5.2"], {
     apiKey: "secret",
-    modelCatalogPath: "/tmp/models.json",
+    modelCatalogPath: "/tmp/paseo-coding-plan-models.json",
   });
-  const official = patchCodexConfig(thirdParty, plan("codex"), ["gpt-5.6-sol"]);
+  const official = patchCodexConfig(thirdParty, plan("codex"), ["gpt-5.6-sol"], {
+    modelCatalogPath: "/tmp/paseo-coding-plan-models.json",
+  });
   assert.doesNotMatch(official, /secret|experimental_bearer_token|model_catalog_json/);
   assert.match(official, /model_provider = "openai"/);
+});
+
+test("preserves a user Codex model catalog when switching back to OAuth", () => {
+  const source = `model_provider = "paseo-coding-plan"
+model = "glm-5.3"
+model_catalog_json = "/tmp/user/paseo-coding-plan-models.json"
+
+# BEGIN paseo-coding-plan-manager
+[model_providers.paseo-coding-plan]
+experimental_bearer_token = "managed-secret"
+# END paseo-coding-plan-manager
+`;
+  const output = patchCodexConfig(source, plan("codex"), ["gpt-5.6-sol"], {
+    modelCatalogPath: "/tmp/codex/paseo-coding-plan-models.json",
+  });
+
+  assert.match(output, /model_catalog_json = "\/tmp\/user\/paseo-coding-plan-models\.json"/);
+  assert.doesNotMatch(output, /managed-secret|experimental_bearer_token/);
+  assert.match(output, /model_provider = "openai"/);
+});
+
+test("removes a relative Codex catalog only when it resolves to the managed path", () => {
+  const source = `model_provider = "paseo-coding-plan"
+model = "glm-5.3"
+model_catalog_json = "paseo-coding-plan-models.json"
+`;
+  const output = patchCodexConfig(source, plan("codex"), ["gpt-5.6-sol"], {
+    modelCatalogPath: "/tmp/codex/paseo-coding-plan-models.json",
+  });
+
+  assert.doesNotMatch(output, /model_catalog_json/);
 });
 
 test("does not write Chat-only Codex config and keeps Z.AI keys out of auth.json", async () => {

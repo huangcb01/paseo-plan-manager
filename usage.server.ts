@@ -26,7 +26,9 @@ import {
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 6_000;
 const HISTORY_REQUEST_BUDGET_MS = 8_000;
+// Covers current usage and history together, leaving RPC time for cache I/O and serialization.
 const REFRESH_BUDGET_MS = 24_000;
+const MIN_CACHE_WRITE_BUDGET_MS = 2_000;
 export const LOCAL_QUOTA_SAMPLE_INTERVAL_SECONDS = 5 * 60;
 const LOCAL_QUOTA_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCAL_QUOTA_HISTORY_MAX_POINTS = Math.ceil(
@@ -97,6 +99,24 @@ class HttpError extends Error {
 }
 
 class ProviderPayloadError extends Error {}
+
+class ProviderRequestError extends Error {}
+
+async function beforeRefreshDeadline<T>(operation: () => Promise<T>, deadline: number): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("Usage refresh deadline exceeded");
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Usage refresh deadline exceeded")), remaining);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -242,6 +262,9 @@ async function fetchJson(
   ) {
     throw new Error("Refusing an unexpected provider URL");
   }
+  if (Object.values(headers).some((value) => /[\r\n]/.test(value))) {
+    throw new ProviderRequestError("Provider credential contains invalid line breaks");
+  }
 
   let lastError: unknown;
   const attempts = Math.max(1, options.attempts ?? 2);
@@ -283,7 +306,8 @@ async function fetchJson(
   }
 
   if ((lastError as Error)?.name === "AbortError") throw new Error("Provider request timed out");
-  throw lastError instanceof Error ? lastError : new Error("Provider request failed");
+  if (lastError instanceof HttpError || lastError instanceof ProviderPayloadError) throw lastError;
+  throw new ProviderRequestError("Provider request failed");
 }
 
 function codexWindow(
@@ -307,13 +331,59 @@ function codexWindow(
   };
 }
 
+function codexSpendControlWindow(raw: unknown): UsageWindow | undefined {
+  if (!isObject(raw)) return undefined;
+  const reached = raw.reached === true;
+  const individualLimit = valueAt(raw, "individual_limit", "individualLimit");
+  if (!isObject(individualLimit)) {
+    const limit = stringValue(individualLimit);
+    if (limit !== undefined) {
+      return {
+        id: "spend-control",
+        label: "个人额度",
+        ...(reached ? { usedPercent: 100 } : {}),
+        limit,
+      };
+    }
+    return reached ? { id: "spend-control", label: "个人额度", usedPercent: 100 } : undefined;
+  }
+  const used = stringValue(individualLimit.used);
+  const limit = stringValue(individualLimit.limit);
+  const remaining = stringValue(individualLimit.remaining);
+  const explicitPercent = clampPercent(numberValue(valueAt(
+    individualLimit,
+    "used_percent",
+    "usedPercent",
+  )));
+  const usedPercent = reached ? 100 : explicitPercent ?? percentFrom(used, limit);
+  const resetAt = timestampIso(valueAt(individualLimit, "reset_at", "resetAt"), "seconds") ?? (() => {
+    const after = numberValue(valueAt(
+      individualLimit,
+      "reset_after_seconds",
+      "resetAfterSeconds",
+    ));
+    return after === undefined ? undefined : new Date(Date.now() + after * 1000).toISOString();
+  })();
+  return {
+    id: "spend-control",
+    label: "个人额度",
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    ...(used ? { used } : {}),
+    ...(limit ? { limit } : {}),
+    ...(remaining ? { remaining } : {}),
+    ...(resetAt ? { resetAt } : {}),
+  };
+}
+
 export function normalizeCodexUsage(raw: unknown, planId: string): UsageSnapshot {
   if (!isObject(raw)) throw new Error("Codex usage response has an unexpected shape");
   if (raw.error !== undefined) throw new Error("Codex usage API rejected the request");
+  const spendControl = valueAt(raw, "spend_control", "spendControl");
   if (
     valueAt(raw, "plan_type", "planType") === undefined &&
     valueAt(raw, "rate_limit", "rateLimit") === undefined &&
-    raw.credits === undefined
+    raw.credits === undefined &&
+    spendControl === undefined
   ) {
     throw new Error("Codex usage response does not contain quota data");
   }
@@ -351,6 +421,8 @@ export function normalizeCodexUsage(raw: unknown, planId: string): UsageSnapshot
       if (secondary) windows.push({ ...secondary, label: `${name} · ${secondary.label}` });
     });
   }
+  const spendControlWindow = codexSpendControlWindow(spendControl);
+  if (spendControlWindow) windows.push(spendControlWindow);
 
   const credits = valueAt(raw, "credits");
   const balance = isObject(credits) ? stringValue(credits.balance) : undefined;
@@ -721,11 +793,12 @@ interface TokenActivityFetchResult {
 async function optionalTokenActivity(
   request: Promise<unknown>,
   normalize: (raw: unknown) => TokenActivity,
+  secret: PlanSecret,
 ): Promise<TokenActivityFetchResult> {
   try {
     return { tokenActivity: normalize(await request), tokenActivityStale: false };
   } catch (error) {
-    return { tokenActivityStale: true, tokenActivityError: safeError(error) };
+    return { tokenActivityStale: true, tokenActivityError: safeError(error, secret) };
   }
 }
 
@@ -833,6 +906,7 @@ async function fetchPlanTokenActivity(
           { attempts: 1, timeoutMs: HISTORY_REQUEST_BUDGET_MS },
         ),
         normalizeCodexTokenActivity,
+        secret,
       );
     }
     if (secret.kind !== "api-key") throw new Error("API key is missing");
@@ -851,14 +925,29 @@ async function fetchPlanTokenActivity(
         { attempts: 1, timeoutMs: HISTORY_REQUEST_BUDGET_MS },
       ),
       normalizeZhipuTokenActivity,
+      secret,
     );
   } catch (error) {
-    return { tokenActivityStale: true, tokenActivityError: safeError(error) };
+    return { tokenActivityStale: true, tokenActivityError: safeError(error, secret) };
   }
 }
 
-function safeError(error: unknown): string {
-  const message = error instanceof Error ? error.message : "Usage refresh failed";
+function safeError(error: unknown, secret?: PlanSecret): string {
+  let message = error instanceof Error ? error.message : "Usage refresh failed";
+  let sensitiveValues: string[] = [];
+  if (secret?.kind === "api-key") {
+    sensitiveValues = secret.apiKey ? [secret.apiKey] : [];
+  } else if (secret?.kind === "codex-auth") {
+    const tokens = secret.auth.tokens;
+    if (isObject(tokens)) {
+      sensitiveValues = ["access_token", "refresh_token", "id_token"]
+        .map((key) => tokens[key])
+        .filter((value): value is string => typeof value === "string" && value.length > 0);
+    }
+  }
+  for (const value of sensitiveValues) message = message.split(value).join("[redacted]");
+  message = message.replace(/\bBearer\s+[^\s,;\])}]+/gi, "Bearer [redacted]");
+  if (/\bAuthorization\b/i.test(message)) return "Provider request failed";
   return message.replace(/[\r\n]+/g, " ").slice(0, 300);
 }
 
@@ -899,12 +988,12 @@ export async function refreshUsageSnapshots(
   planId?: string,
   store: PlanStore = planStore,
 ): Promise<UsageSnapshot[]> {
-  const snapshots = await store.snapshotPlans(planId);
+  const deadline = Date.now() + REFRESH_BUDGET_MS;
+  const snapshots = await beforeRefreshDeadline(() => store.snapshotPlans(planId), deadline);
   const plans = snapshots.map((snapshot) => snapshot.plan);
-  const previous = await store.readUsageCache();
+  const previous = await beforeRefreshDeadline(() => store.readUsageCache(), deadline);
   const previousByPlan = new Map(previous.map((snapshot) => [snapshot.planId, snapshot]));
 
-  const deadline = Date.now() + REFRESH_BUDGET_MS;
   const results = new Array<UsageSnapshot>(snapshots.length);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(4, snapshots.length) }, async () => {
@@ -914,11 +1003,13 @@ export async function refreshUsageSnapshots(
       const snapshot = snapshots[index];
       const plan = snapshot.plan;
       try {
+        if ("secretError" in snapshot) throw snapshot.secretError;
         results[index] = await fetchPlanUsage(plan, snapshot.secret, deadline);
       } catch (error) {
         const cached = previousByPlan.get(plan.id);
+        const secret = "secret" in snapshot ? snapshot.secret : undefined;
         if (cached) {
-          results[index] = { ...cached, status: "error", stale: true, error: safeError(error) };
+          results[index] = { ...cached, status: "error", stale: true, error: safeError(error, secret) };
           continue;
         }
         results[index] = {
@@ -927,25 +1018,30 @@ export async function refreshUsageSnapshots(
           stale: true,
           fetchedAt: new Date().toISOString(),
           windows: [],
-          error: safeError(error),
+          error: safeError(error, secret),
         };
       }
     }
   });
   await Promise.all(workers);
 
+  if (Date.now() >= deadline) throw new Error("Usage refresh deadline exceeded");
+
   const historyIndexes = snapshots
     .map((snapshot, index) => ({ snapshot, index }))
     .filter(({ snapshot, index }) => (
-      snapshot.plan.provider !== "kimi" && results[index]?.status === "ok"
+      "secret" in snapshot &&
+      snapshot.plan.provider !== "kimi" &&
+      results[index]?.status === "ok"
     ));
-  const historyDeadline = Date.now() + HISTORY_REQUEST_BUDGET_MS;
+  const historyDeadline = Math.min(deadline, Date.now() + HISTORY_REQUEST_BUDGET_MS);
   let historyCursor = 0;
   const historyWorkers = Array.from({ length: Math.min(4, historyIndexes.length) }, async () => {
     while (historyCursor < historyIndexes.length) {
       const cursorIndex = historyCursor;
       historyCursor += 1;
       const { snapshot, index } = historyIndexes[cursorIndex];
+      if (!("secret" in snapshot)) continue;
       const activity = await fetchPlanTokenActivity(snapshot.plan, snapshot.secret, historyDeadline);
       if (activity) results[index] = { ...results[index], ...activity };
     }
@@ -958,9 +1054,16 @@ export async function refreshUsageSnapshots(
     results[index] = mergeUsageHistory(plan, result, previousByPlan.get(plan.id));
   });
 
+  if (deadline - Date.now() < MIN_CACHE_WRITE_BUDGET_MS) {
+    throw new Error("Usage refresh deadline exceeded");
+  }
+
   const startedPlans = new Map(plans.map((plan) => [plan.id, plan.updatedAt]));
   const successful = results.filter((snapshot) => snapshot.status === "ok");
   const currentPlanIds = await store.mergeUsageCache(successful, startedPlans);
+  if (Date.now() >= deadline) {
+    return results.filter((snapshot) => currentPlanIds.has(snapshot.planId));
+  }
   const cachedByPlan = new Map((await store.readUsageCache()).map((snapshot) => [snapshot.planId, snapshot]));
   return results
     .filter((snapshot) => currentPlanIds.has(snapshot.planId))

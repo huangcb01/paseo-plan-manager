@@ -14,7 +14,17 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+export class FileTooLargeError extends Error {
+  constructor(
+    readonly filePath: string,
+    readonly maxBytes: number,
+  ) {
+    super(`File is too large: ${filePath}`);
+    this.name = "FileTooLargeError";
+  }
+}
 
 export interface FileSnapshot {
   exists: boolean;
@@ -53,8 +63,10 @@ export async function readFileIfExists(
   try {
     const info = await stat(filePath);
     if (!info.isFile()) throw new Error(`Not a regular file: ${filePath}`);
-    if (info.size > maxBytes) throw new Error(`File is too large: ${filePath}`);
-    return await readFile(filePath);
+    if (info.size > maxBytes) throw new FileTooLargeError(filePath, maxBytes);
+    const contents = await readFile(filePath);
+    if (contents.byteLength > maxBytes) throw new FileTooLargeError(filePath, maxBytes);
+    return contents;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;

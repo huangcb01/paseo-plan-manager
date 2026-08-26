@@ -1793,6 +1793,7 @@ function PlanCard({
 function PlanEditor({
   editor,
   setEditor,
+  dashboard,
   saving,
   styles,
   placeholderColor,
@@ -1802,6 +1803,7 @@ function PlanEditor({
 }: {
   editor: EditorState;
   setEditor: (next: EditorState) => void;
+  dashboard?: Dashboard;
   saving: boolean;
   styles: Styles;
   placeholderColor: string;
@@ -1810,8 +1812,8 @@ function PlanEditor({
   embedded?: boolean;
 }) {
   function selectProvider(provider: Provider) {
-    if (editor.id) return;
-    setEditor({ ...emptyEditor(provider), label: editor.label });
+    if (editor.id || editor.provider === provider) return;
+    setEditor({ ...emptyEditor(provider, dashboard), label: editor.label });
   }
   return (
     <View style={[styles.editor, embedded && styles.editorCard]}>
@@ -2092,6 +2094,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
   });
 
   const dashboard = dashboardQuery.data as Dashboard | undefined;
+  const dashboardError = dashboardQuery.error ? errorMessage(dashboardQuery.error) : undefined;
   const refreshedUsage = (usageQuery.data as { usage: UsageSnapshot[] } | undefined)?.usage;
   const usageError = usageQuery.error ? errorMessage(usageQuery.error) : undefined;
   const usage: UsageSnapshot[] = (refreshedUsage ?? dashboard?.usage ?? []).map((snapshot) =>
@@ -2130,7 +2133,6 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
           }
         : { apiKey: editor.apiKey || undefined }),
     };
-    if (editor.provider !== "codex") setEditor({ ...editor, apiKey: "" });
     setSaving(true);
     try {
       const saved = await saveRpc(input);
@@ -2230,10 +2232,18 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
           </View>
         ) : null}
 
+        {dashboard && dashboardError ? (
+          <View style={[styles.notice, styles.noticeError]}>
+            <Text style={styles.noticeText}>Dashboard 刷新失败，当前显示缓存数据。</Text>
+            <Text style={styles.noticeDetail}>{dashboardError}</Text>
+          </View>
+        ) : null}
+
         {editor && !editor.id ? (
           <PlanEditor
             editor={editor}
             setEditor={setEditor}
+            dashboard={dashboard}
             saving={saving}
             styles={styles}
             placeholderColor={theme.colors.foregroundMuted}
@@ -2259,9 +2269,9 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
             <ActivityIndicator color={theme.colors.accent} />
             <Text style={styles.muted}>正在读取 daemon 上的 Coding Plans...</Text>
           </View>
-        ) : dashboardQuery.error ? (
+        ) : dashboardError && !dashboard ? (
           <View style={styles.empty}>
-            <Text style={styles.error}>{errorMessage(dashboardQuery.error)}</Text>
+            <Text style={styles.error}>{dashboardError}</Text>
           </View>
         ) : dashboard?.plans.length ? (
           <View style={styles.cards}>
@@ -2272,6 +2282,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
                     key={plan.id}
                     editor={editor}
                     setEditor={setEditor}
+                    dashboard={dashboard}
                     saving={saving}
                     styles={styles}
                     placeholderColor={theme.colors.foregroundMuted}

@@ -41,12 +41,12 @@ export default function contribute(plugin: PluginContext) {
   });
   plugin.addCommandCenterItem({
     id: "refresh-coding-plans",
-    title: "Open and refresh Coding Plan usage",
+    title: "Refresh Coding Plan usage",
     icon: "RefreshCw",
     keywords: ["quota", "usage"],
     context: "workspace",
-    onSelect({ openPanel }) {
-      openPanel("coding-plans");
+    async onSelect({ rpc }) {
+      await rpc(refreshUsage, {});
     },
   });
   return () => {};
