@@ -12,6 +12,7 @@
 - 展示 Codex 主/次/附加限额、智谱新 `CREDIT_LIMIT` 与旧 `TOKENS_LIMIT` 的 5 小时/周窗口及 MCP 限额、Kimi 周额度/全部限流窗口/并发上限。
 - Codex 和智谱额外展示服务端 7/30 天 Token 活动；Kimi 每 5 分钟至多保存一个本地配额快照并保留 7 天。
 - 应用 Plan 时再为目标工具选择 1–16 个模型，首个作为当前默认；模型列表仅用于本次写入，不保存到 Plan。
+- 每个 API Key 模型可在写入前调整本次接入使用的能力 metadata；编辑范围会按目标工具实际支持的目录字段收窄。
 - 将所选模型写入 OpenCode 自定义 provider、智谱 Codex 模型目录或 Claude Code model picker，同时保留无关配置和 JSONC 注释。
 - 检测 `opencode`、`codex`、`claude` 是否存在；插件不包含、下载或安装任何 CLI。
 
@@ -88,6 +89,8 @@ Codex 当前额度仍来自 `/backend-api/wham/usage`；按日 Token 活动来�
 
 点击 Plan 卡片上的“配置到…”后，插件会按 provider 和目标工具预填推荐模型。可在确认写入前选择并排序最多 16 个模型 ID；首个模型是目标工具的当前默认，整个列表仅用于本次配置，不会保存回 Coding Plan。
 
+每个智谱或 Kimi 模型行都有“参数”按钮。参数调整和模型选择一样只存在于当前写入草稿：OpenCode 可编辑 context/input/output、输入输出模态、推理、附件、工具调用、temperature 和 interleaved 字段；Codex 只映射 context、Codex 支持的输入模态和推理目录 metadata；Claude Code 只映射全局 context。ChatGPT OAuth 使用目标工具内置模型目录，因此显示“工具内置”，不伪造可编辑 metadata。
+
 | Plan | OpenCode | Codex | Claude Code |
 | --- | --- | --- | --- |
 | Codex OAuth | 支持；首个模型为默认，不修改内置 OpenAI 目录 | 支持；首个模型为默认，写入原生 Codex auth，不修改内置目录 | 不直连；需要协议转换代理，插件会拒绝写入假配置 |
@@ -102,7 +105,7 @@ Codex 当前额度仍来自 `/backend-api/wham/usage`；按日 Token 活动来�
 - 凭据：`$XDG_DATA_HOME/opencode/auth.json`，否则 `~/.local/share/opencode/auth.json`。
 - 已存在 `opencode.jsonc` 时优先修改它，否则使用 `opencode.json`。
 
-智谱和 Kimi 会把本次所选模型及其 context/output、输入输出模态、推理、附件、工具调用和 temperature 能力写入 `provider.zhipu.models` 或 `provider.kimi.models`；GLM 还会写入 `reasoning_content` interleaved 协议字段。首个模型用于更新顶层 `model`；未知自定义模型已有的能力声明不会被覆盖。插件只更新该 provider 中由自身管理的连接和模型字段，保留用户的 timeout、headers、其他模型及 JSONC 注释。Codex OAuth 只更新顶层默认模型，不改 OpenCode 内置 OpenAI 模型目录。插件还会更新对应 auth 条目，其他 provider、插件、MCP 和 skills 会保留。若设置了 `OPENCODE_CONFIG_CONTENT` 或 `OPENCODE_AUTH_CONTENT`，文件修改不会生效，因此插件会拒绝操作。
+智谱和 Kimi 会把本次所选模型及其 context/output、输入输出模态、推理、附件、工具调用和 temperature 能力写入 `provider.zhipu.models` 或 `provider.kimi.models`；GLM 还会写入 `reasoning_content` interleaved 协议字段。首个模型用于更新顶层 `model`；未知自定义模型已有的能力声明不会被覆盖，打开参数编辑器时也只写入相对估算默认值实际改动的字段。参数面板会按 OpenCode 1.18.18 的默认规则预估自动压缩阈值：未设置 input 时从 context 最多预留 32,000 output token；设置 input 后从 input 最多预留 20,000。插件只更新该 provider 中由自身管理的连接和模型字段，保留用户的 timeout、headers、其他模型及 JSONC 注释。Codex OAuth 只更新顶层默认模型，不改 OpenCode 内置 OpenAI 模型目录。插件还会更新对应 auth 条目，其他 provider、插件、MCP 和 skills 会保留。若设置了 `OPENCODE_CONFIG_CONTENT` 或 `OPENCODE_AUTH_CONTENT`，文件修改不会生效，因此插件会拒绝操作。
 
 OpenCode 的 Active 状态按 provider 分槽保存：Codex、智谱和 Kimi 各自最多保留一个 Plan，因此三个 provider 的凭据和目录状态可以同时共存；再次应用同一 provider 的 Plan 只替换该 provider 的记录。不过 OpenCode 顶层 `model` 始终只有一个，最近一次成功应用的 Plan 首个模型是当前默认。Codex 和 Claude Code 的 Active 状态仍各自是单例，后一次成功应用会替换该目标先前的 Plan。
 
@@ -118,14 +121,14 @@ OpenCode 的 Active 状态按 provider 分槽保存：Codex、智谱和 Kimi 各
 
 Codex 自定义 provider 要求 OpenAI Responses wire API。当前能力按供应商公开文档处理：
 
-- Z.AI Global 使用 `https://api.z.ai/api/v1`，智谱中国区使用 `https://open.bigmodel.cn/api/v1`；两者都是官方 Responses 端点。插件把全部所选模型及各自 metadata 写入独立模型目录，同时写入 `experimental_bearer_token` 和 `wire_api = "responses"`，不覆盖 Codex OAuth `auth.json`。`glm-5.3` 使用 1,048,576 context window，其他模型使用 204,800。
+- Z.AI Global 使用 `https://api.z.ai/api/v1`，智谱中国区使用 `https://open.bigmodel.cn/api/v1`；两者都是官方 Responses 端点。插件把官方 Codex 指南当前列出的 `glm-5.3`、`glm-5-turbo` 及各自 metadata 写入独立模型目录，同时写入 `experimental_bearer_token` 和 `wire_api = "responses"`，不覆盖 Codex OAuth `auth.json`。`glm-5.3` 使用 1,048,576 context window 并公开 low/high/max effort，`glm-5-turbo` 使用 204,800 且不公开 effort 切换。Codex 的核心工具不能由模型目录可靠禁用，因此参数面板不提供该开关。
 - 智谱 Dev 尚无已验证的 Responses 端点；Kimi Coding 公开的是 Chat Completions 接口。二者需要类似 CC Switch 的本地双向协议转换代理，本插件当前不内置，因此按钮显示“需代理”，daemon 也会拒绝写入。
 
 Codex OAuth 切换只支持 `cli_auth_credentials_store = "file"` 或未显式配置存储模式。若设置为 `keyring`、`auto` 或 `ephemeral`，插件不会修改系统钥匙串，也不会声称切换成功。
 
 ### Claude Code
 
-路径为 `$CLAUDE_CONFIG_DIR/settings.json` 或 `~/.claude/settings.json`。插件以首个所选模型设置 `env` 中的默认模型，并替换自身标记的 `modelPicker.options`；真正的用户选项和 `replaceBuiltInOptions` 会保留，因此切换 Kimi/智谱或重新选择模型时不会留下不可用的旧 provider 项。多模型候选需要 Claude Code 2.1.242 或更高版本。插件同时保留 permissions、hooks、plugins 及其他环境变量，并合并对应 profile 的 onboarding 状态：默认是 `~/.claude.json`；设置 `CLAUDE_CONFIG_DIR` 时使用该目录内已有的 `.config.json`，否则使用 `.claude.json`。Kimi 额外设置官方要求的 `penguinModeOrgEnabled`。Kimi 使用 `ANTHROPIC_API_KEY`，并同时设置 Fable、Haiku、Sonnet、Opus、subagent 和 effort 变量；智谱使用 `ANTHROPIC_AUTH_TOKEN`。只有全部所选 Kimi 模型均为 `k3` / `k3[1m]` 时才启用 1,048,576 context window，混合列表回退到 262,144。
+路径为 `$CLAUDE_CONFIG_DIR/settings.json` 或 `~/.claude/settings.json`。插件以首个所选模型设置 `env` 中的默认模型，并替换自身标记的 `modelPicker.options`；真正的用户选项和 `replaceBuiltInOptions` 会保留，因此切换 Kimi/智谱或重新选择模型时不会留下不可用的旧 provider 项。多模型候选需要 Claude Code 2.1.242 或更高版本。插件同时保留 permissions、hooks、plugins 及其他环境变量，并合并对应 profile 的 onboarding 状态：默认是 `~/.claude.json`；设置 `CLAUDE_CONFIG_DIR` 时使用该目录内已有的 `.config.json`，否则使用 `.claude.json`。Kimi 额外设置官方要求的 `penguinModeOrgEnabled`。Kimi 使用 `ANTHROPIC_API_KEY`，并同时设置 Fable、Haiku、Sonnet、Opus、subagent 和 effort 变量；智谱使用 `ANTHROPIC_AUTH_TOKEN`。多个模型使用最小容量；`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 保留模型容量，而 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 限制在 100,000–1,000,000 后再由模型容量封顶。Kimi `k3` 保留 1,048,576 容量，`k3[1m]` 和带 `[1m]` 后缀的 GLM 使用 1,000,000，普通模型保留供应商推荐窗口。
 
 ChatGPT Codex 后端是 OpenAI Responses 协议，Claude Code 发出 Anthropic Messages 协议，二者不能只靠环境变量直连。该组合会明确返回“未写入”，不会制造表面成功。
 

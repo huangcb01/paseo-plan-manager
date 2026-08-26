@@ -31,6 +31,19 @@ import {
   type UsageWindow,
   type ZhipuRegion,
 } from "./plans.shared";
+import {
+  CLAUDE_AUTO_COMPACT_MAX,
+  estimatedOpenCodeCompactionThreshold,
+  isKnownCapabilityModel,
+  ModelCapabilityParametersSchema,
+  targetModelCapabilityParameters,
+  type CapabilityProvider,
+  type ModelCapabilityField,
+  type ModelCapabilityParameters,
+  type ModelInterleavedField,
+  type ModelModality,
+  type ModelParameterOverride,
+} from "./model-capabilities.shared";
 
 interface EditorState {
   id?: string;
@@ -49,6 +62,8 @@ interface ApplyDraft {
   planId: string;
   target: Target;
   models: string[];
+  modelParameters: ModelParameterOverride[];
+  editingModel?: string;
   customModel: string;
   pickerOpen: boolean;
 }
@@ -88,13 +103,69 @@ function modelCandidatesFor(provider: Provider, target: Target): readonly string
     return ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.3-codex-spark"];
   }
   if (provider === "zhipu") {
-    if (target === "codex") return ["glm-5.3", "glm-5-turbo", "glm-4.7"];
+    if (target === "codex") return ["glm-5.3", "glm-5-turbo"];
     if (target === "claude") return ["glm-5.1", "glm-5.3", "glm-5.3[1m]", "glm-5-turbo", "glm-4.7"];
     return ["glm-5.1", "glm-5.3", "glm-5-turbo", "glm-4.7"];
   }
   return target === "claude"
     ? ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3[1m]", "k3-256k"]
     : ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k"];
+}
+
+function modelOverride(
+  overrides: readonly ModelParameterOverride[],
+  model: string,
+): ModelParameterOverride | undefined {
+  return overrides.find((override) => override.model === model);
+}
+
+interface ModelParameterDraft {
+  context: string;
+  input: string;
+  output: string;
+  inputModalities: ModelModality[];
+  outputModalities: ModelModality[];
+  reasoning: boolean;
+  attachment: boolean;
+  toolCall: boolean;
+  temperature: boolean;
+  interleaved: ModelInterleavedField | null;
+}
+
+function modelParameterDraft(parameters: ModelCapabilityParameters): ModelParameterDraft {
+  return {
+    context: String(parameters.limit.context),
+    input: parameters.limit.input === undefined ? "" : String(parameters.limit.input),
+    output: String(parameters.limit.output),
+    inputModalities: [...parameters.modalities.input],
+    outputModalities: [...parameters.modalities.output],
+    reasoning: parameters.reasoning,
+    attachment: parameters.attachment,
+    toolCall: parameters.toolCall,
+    temperature: parameters.temperature,
+    interleaved: parameters.interleaved,
+  };
+}
+
+function modelParameterFieldMatches(
+  field: ModelCapabilityField,
+  draft: ModelParameterDraft,
+  defaults: ModelParameterDraft,
+): boolean {
+  const sameModalities = (left: readonly ModelModality[], right: readonly ModelModality[]) =>
+    left.length === right.length && left.every((modality) => right.includes(modality));
+  switch (field) {
+    case "limit.context": return draft.context === defaults.context;
+    case "limit.input": return draft.input === defaults.input;
+    case "limit.output": return draft.output === defaults.output;
+    case "modalities.input": return sameModalities(draft.inputModalities, defaults.inputModalities);
+    case "modalities.output": return sameModalities(draft.outputModalities, defaults.outputModalities);
+    case "reasoning": return draft.reasoning === defaults.reasoning;
+    case "attachment": return draft.attachment === defaults.attachment;
+    case "toolCall": return draft.toolCall === defaults.toolCall;
+    case "temperature": return draft.temperature === defaults.temperature;
+    case "interleaved": return draft.interleaved === defaults.interleaved;
+  }
 }
 
 function emptyEditor(provider: Provider, dashboard?: Dashboard): EditorState {
@@ -803,6 +874,7 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     modelOption: {
       flexDirection: "row",
       alignItems: "center",
+      flexWrap: "wrap",
       gap: 7,
     },
     modelOptionToggle: {
@@ -854,6 +926,110 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       color: theme.colors.foregroundMuted,
       fontSize: 9,
       fontWeight: "700",
+    },
+    modelOptionActions: {
+      flexDirection: "row",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: 4,
+    },
+    modelParameterAction: {
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      paddingHorizontal: 6,
+      paddingVertical: 3,
+    },
+    modelParameterActionActive: {
+      borderColor: theme.colors.accent,
+    },
+    modelParameterActionText: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 9,
+      fontWeight: "700",
+    },
+    modelParameterActionTextActive: {
+      color: theme.colors.accent,
+    },
+    modelParameterEdited: {
+      color: theme.colors.accent,
+      fontSize: 8,
+      fontWeight: "900",
+      letterSpacing: 0.4,
+    },
+    modelParameterEditor: {
+      width: "100%",
+      borderLeftWidth: 2,
+      borderLeftColor: theme.colors.accent,
+      paddingLeft: 10,
+      paddingVertical: 7,
+      gap: 10,
+    },
+    modelParameterHeader: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      justifyContent: "space-between",
+      flexWrap: "wrap",
+      gap: 7,
+    },
+    modelParameterTitle: {
+      color: theme.colors.foreground,
+      fontSize: 12,
+      fontWeight: "800",
+    },
+    modelParameterScope: {
+      color: theme.colors.accent,
+      fontSize: 8,
+      fontWeight: "900",
+      letterSpacing: 0.5,
+    },
+    modelParameterGrid: {
+      flexDirection: "row",
+      flexWrap: "wrap",
+      gap: 8,
+    },
+    modelParameterField: {
+      minWidth: 135,
+      width: undefined,
+      flexGrow: 1,
+      flexBasis: 135,
+    },
+    modelParameterGroup: {
+      gap: 6,
+    },
+    modelParameterChoices: {
+      flexDirection: "row",
+      flexWrap: "wrap",
+      gap: 5,
+    },
+    modelParameterChoice: {
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      paddingHorizontal: 7,
+      paddingVertical: 4,
+    },
+    modelParameterChoiceActive: {
+      borderColor: theme.colors.accent,
+      backgroundColor: theme.colors.accent,
+    },
+    modelParameterChoiceText: {
+      color: theme.colors.foregroundMuted,
+      fontSize: 9,
+      fontWeight: "700",
+    },
+    modelParameterChoiceTextActive: {
+      color: theme.colors.accentForeground,
+    },
+    modelParameterMath: {
+      borderWidth: 1,
+      borderColor: theme.colors.foregroundMuted,
+      paddingHorizontal: 9,
+      paddingVertical: 7,
+      gap: 2,
+    },
+    modelParameterMathValue: {
+      color: theme.colors.accent,
+      fontSize: 13,
+      fontWeight: "900",
     },
     editorTitle: {
       color: theme.colors.foreground,
@@ -1142,7 +1318,9 @@ function Field({
   disabled = false,
   multiline = false,
   constrained = false,
+  parameter = false,
   maxLength,
+  keyboardType,
 }: {
   label: string;
   value: string;
@@ -1155,10 +1333,17 @@ function Field({
   disabled?: boolean;
   multiline?: boolean;
   constrained?: boolean;
+  parameter?: boolean;
   maxLength?: number;
+  keyboardType?: "numeric";
 }) {
   return (
-    <View style={[styles.field, wide && styles.fieldWide, constrained && styles.fieldConstrained]}>
+    <View style={[
+      styles.field,
+      wide && styles.fieldWide,
+      constrained && styles.fieldConstrained,
+      parameter && styles.modelParameterField,
+    ]}>
       <Text style={styles.fieldLabel}>{label}</Text>
       <TextInput
         accessibilityLabel={label}
@@ -1170,6 +1355,7 @@ function Field({
         secureTextEntry={secure}
         editable={!disabled}
         maxLength={maxLength}
+        keyboardType={keyboardType}
         multiline={multiline}
         numberOfLines={multiline ? 10 : 1}
         textAlignVertical={multiline ? "top" : "center"}
@@ -1177,6 +1363,373 @@ function Field({
         autoCorrect={false}
         style={[styles.input, multiline && styles.inputMultiline, disabled && styles.buttonDisabled]}
       />
+    </View>
+  );
+}
+
+const MODALITY_LABELS: Record<ModelModality, string> = {
+  text: "TEXT",
+  audio: "AUDIO",
+  image: "IMAGE",
+  video: "VIDEO",
+  pdf: "PDF",
+};
+
+function ParameterChoice({
+  label,
+  selected,
+  onPress,
+  styles,
+  disabled = false,
+  role = "checkbox",
+}: {
+  label: string;
+  selected: boolean;
+  onPress: () => void;
+  styles: Styles;
+  disabled?: boolean;
+  role?: "checkbox" | "radio";
+}) {
+  return (
+    <Pressable
+      accessibilityRole={role}
+      accessibilityState={{ checked: selected, disabled }}
+      aria-checked={selected}
+      disabled={disabled}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.modelParameterChoice,
+        selected && styles.modelParameterChoiceActive,
+        disabled && styles.buttonDisabled,
+        pressed && !disabled && styles.buttonPressed,
+      ]}
+    >
+      <Text style={[
+        styles.modelParameterChoiceText,
+        selected && styles.modelParameterChoiceTextActive,
+      ]}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+function ModelParameterEditor({
+  provider,
+  target,
+  model,
+  parameters,
+  defaults,
+  fields,
+  overridden,
+  disabled,
+  styles,
+  placeholderColor,
+  onSave,
+  onReset,
+  onCancel,
+}: {
+  provider: CapabilityProvider;
+  target: Target;
+  model: string;
+  parameters: ModelCapabilityParameters;
+  defaults: ModelCapabilityParameters;
+  fields: readonly ModelCapabilityField[];
+  overridden: boolean;
+  disabled: boolean;
+  styles: Styles;
+  placeholderColor: string;
+  onSave: (parameters: ModelCapabilityParameters, fields: ModelCapabilityField[]) => void;
+  onReset: () => void;
+  onCancel: () => void;
+}) {
+  const [defaultDraft] = useState<ModelParameterDraft>(() => modelParameterDraft(defaults));
+  const [draft, setDraft] = useState<ModelParameterDraft>(() => modelParameterDraft(parameters));
+  const [editedFields, setEditedFields] = useState(() => new Set(fields));
+  const [error, setError] = useState<string>();
+  const openCode = target === "opencode";
+  const codex = target === "codex";
+  const known = isKnownCapabilityModel(provider, model);
+  const availableInputModalities: ModelModality[] = codex && known
+    ? ["text"]
+    : codex
+      ? ["text", "image", "audio"]
+      : ["text", "audio", "image", "video", "pdf"];
+
+  function updateDraft(field: ModelCapabilityField, next: ModelParameterDraft) {
+    setDraft(next);
+    setEditedFields((current) => {
+      const updated = new Set(current);
+      if (modelParameterFieldMatches(field, next, defaultDraft)) updated.delete(field);
+      else updated.add(field);
+      return updated;
+    });
+    setError(undefined);
+  }
+
+  function parsedParameters(): { parameters?: ModelCapabilityParameters; error?: string } {
+    const parseLimit = (value: string, label: string, optional = false) => {
+      if (optional && !value.trim()) return undefined;
+      if (!/^\d+$/.test(value.trim())) throw new Error(`${label}必须是正整数`);
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 100_000_000) {
+        throw new Error(`${label}必须在 1 到 100,000,000 之间`);
+      }
+      return parsed;
+    };
+
+    try {
+      const context = parseLimit(draft.context, "Context");
+      const output = openCode
+        ? parseLimit(draft.output, "Output")
+        : Math.min(parameters.limit.output, context ?? parameters.limit.context);
+      const input = openCode ? parseLimit(draft.input, "Input", true) : undefined;
+      if (context === undefined || output === undefined) throw new Error("Token 上限不能为空");
+      if (openCode && known && output > context) throw new Error("Output 不能超过 Context");
+      if (openCode && known && input !== undefined && input > context) {
+        throw new Error("Input 不能超过 Context");
+      }
+      if (target === "claude" && model.endsWith("[1m]") && context > CLAUDE_AUTO_COMPACT_MAX) {
+        throw new Error("Claude 的 [1m] 模型固定为 1,000,000 Context");
+      }
+      const candidate: ModelCapabilityParameters = {
+        limit: {
+          context,
+          ...(input !== undefined ? { input } : {}),
+          output,
+        },
+        modalities: {
+          input: openCode || codex ? draft.inputModalities : [...parameters.modalities.input],
+          output: openCode ? draft.outputModalities : [...parameters.modalities.output],
+        },
+        reasoning: openCode || codex ? draft.reasoning : parameters.reasoning,
+        attachment: openCode ? draft.attachment : parameters.attachment,
+        toolCall: openCode ? draft.toolCall : parameters.toolCall,
+        temperature: openCode ? draft.temperature : parameters.temperature,
+        interleaved: openCode ? draft.interleaved : parameters.interleaved,
+      };
+      const parsed = ModelCapabilityParametersSchema.safeParse(candidate);
+      if (!parsed.success) return { error: parsed.error.issues[0]?.message ?? "能力参数无效" };
+      return { parameters: parsed.data };
+    } catch (parseError) {
+      return { error: errorMessage(parseError) };
+    }
+  }
+
+  function toggleModality(field: "inputModalities" | "outputModalities", modality: ModelModality) {
+    const current = draft[field];
+    const next = current.includes(modality)
+      ? current.length === 1 ? current : current.filter((candidate) => candidate !== modality)
+      : [...current, modality];
+    updateDraft(field === "inputModalities" ? "modalities.input" : "modalities.output", {
+      ...draft,
+      [field]: next,
+    });
+  }
+
+  const preview = parsedParameters();
+  const scope = openCode
+    ? "OPENCODE · 完整能力"
+    : codex
+      ? "CODEX · 目录映射"
+      : "CLAUDE · 全局 CONTEXT";
+
+  return (
+    <View style={styles.modelParameterEditor}>
+      <View style={styles.modelParameterHeader}>
+        <View>
+          <Text style={styles.modelParameterTitle}>{model}</Text>
+          <Text style={styles.modelParameterScope}>{scope}</Text>
+        </View>
+        {!known ? <Text style={styles.modelParameterEdited}>估算默认值</Text> : null}
+      </View>
+      {!known && openCode ? (
+        <Text style={styles.muted}>已有自定义模型只写入你相对估算默认值改动的字段，其他声明保持不变。</Text>
+      ) : null}
+
+      <View style={styles.modelParameterGrid}>
+        <Field
+          label="Context Token"
+          value={draft.context}
+          onChangeText={(context) => updateDraft("limit.context", { ...draft, context })}
+          styles={styles}
+          placeholderColor={placeholderColor}
+          parameter
+          keyboardType="numeric"
+          maxLength={9}
+          disabled={disabled}
+        />
+        {openCode ? (
+          <Field
+            label="Input Token（可选）"
+            value={draft.input}
+            onChangeText={(input) => updateDraft("limit.input", { ...draft, input })}
+            styles={styles}
+            placeholder="留空则按 Context 计算"
+            placeholderColor={placeholderColor}
+            parameter
+            keyboardType="numeric"
+            maxLength={9}
+            disabled={disabled}
+          />
+        ) : null}
+        {openCode ? (
+          <Field
+            label="Output Token"
+            value={draft.output}
+            onChangeText={(output) => updateDraft("limit.output", { ...draft, output })}
+            styles={styles}
+            placeholderColor={placeholderColor}
+            parameter
+            keyboardType="numeric"
+            maxLength={9}
+            disabled={disabled}
+          />
+        ) : null}
+      </View>
+
+      {openCode && preview.parameters ? (
+        <View style={styles.modelParameterMath}>
+          <Text style={styles.fieldLabel}>预计自动压缩阈值 · OpenCode 1.18.18 默认规则</Text>
+          <Text style={styles.modelParameterMathValue}>
+            {estimatedOpenCodeCompactionThreshold(preview.parameters).toLocaleString()} tokens
+          </Text>
+          <Text style={styles.muted}>Output 默认最多预留 32,000；设置 Input 后默认最多预留 20,000。</Text>
+        </View>
+      ) : null}
+
+      {openCode || codex ? (
+        <View style={styles.modelParameterGroup}>
+          <Text style={styles.fieldLabel}>输入模态</Text>
+          <View style={styles.modelParameterChoices}>
+            {availableInputModalities.map((modality) => (
+              <ParameterChoice
+                key={modality}
+                label={MODALITY_LABELS[modality]}
+                selected={draft.inputModalities.includes(modality)}
+                onPress={() => toggleModality("inputModalities", modality)}
+                styles={styles}
+                disabled={disabled || (codex && known)}
+              />
+            ))}
+          </View>
+        </View>
+      ) : null}
+
+      {openCode ? (
+        <View style={styles.modelParameterGroup}>
+          <Text style={styles.fieldLabel}>输出模态</Text>
+          <View style={styles.modelParameterChoices}>
+            {(Object.keys(MODALITY_LABELS) as ModelModality[]).map((modality) => (
+              <ParameterChoice
+                key={modality}
+                label={MODALITY_LABELS[modality]}
+                selected={draft.outputModalities.includes(modality)}
+                onPress={() => toggleModality("outputModalities", modality)}
+                styles={styles}
+                disabled={disabled}
+              />
+            ))}
+          </View>
+        </View>
+      ) : null}
+
+      {openCode || codex ? (
+        <View style={styles.modelParameterGroup}>
+          <Text style={styles.fieldLabel}>能力开关</Text>
+          <View style={styles.modelParameterChoices}>
+            <ParameterChoice
+              label="推理"
+              selected={draft.reasoning}
+              onPress={() => updateDraft("reasoning", { ...draft, reasoning: !draft.reasoning })}
+              styles={styles}
+              disabled={disabled || (codex && known)}
+            />
+            {openCode ? (
+              <ParameterChoice
+                label="附件"
+                selected={draft.attachment}
+                onPress={() => updateDraft("attachment", { ...draft, attachment: !draft.attachment })}
+                styles={styles}
+                disabled={disabled}
+              />
+            ) : null}
+            {openCode ? (
+              <ParameterChoice
+                label="工具调用"
+                selected={draft.toolCall}
+                onPress={() => updateDraft("toolCall", { ...draft, toolCall: !draft.toolCall })}
+                styles={styles}
+                disabled={disabled}
+              />
+            ) : null}
+            {openCode ? (
+              <ParameterChoice
+                label="支持 Temperature"
+                selected={draft.temperature}
+                onPress={() => updateDraft("temperature", { ...draft, temperature: !draft.temperature })}
+                styles={styles}
+                disabled={disabled}
+              />
+            ) : null}
+          </View>
+        </View>
+      ) : null}
+
+      {openCode ? (
+        <View style={styles.modelParameterGroup}>
+          <Text style={styles.fieldLabel}>推理回传字段</Text>
+          <View
+            accessibilityRole="radiogroup"
+            accessibilityLabel="推理回传字段"
+            style={styles.modelParameterChoices}
+          >
+            {([null, "reasoning", "reasoning_content", "reasoning_text"] as const).map((field) => (
+              <ParameterChoice
+                key={field ?? "none"}
+                label={field ?? "无"}
+                selected={draft.interleaved === field}
+                onPress={() => updateDraft("interleaved", { ...draft, interleaved: field })}
+                styles={styles}
+                disabled={disabled}
+                role="radio"
+              />
+            ))}
+          </View>
+        </View>
+      ) : null}
+
+      {target === "claude" ? (
+        <Text style={styles.muted}>Claude Code 写入模型容量，并将自动压缩窗口限制在 100,000–1,000,000 后再由模型容量封顶；多个模型使用最小 context。</Text>
+      ) : target === "codex" ? (
+        <Text style={styles.muted}>Codex 映射 context、输入模态和推理目录能力；官方模型固定为 text 输入和推理模式，核心工具使用官方目录。</Text>
+      ) : null}
+      {error ? (
+        <Text accessibilityRole="alert" accessibilityLiveRegion="assertive" style={styles.error}>
+          {error}
+        </Text>
+      ) : null}
+
+      <View style={styles.row}>
+        <Button label="取消" onPress={onCancel} styles={styles} disabled={disabled} />
+        {overridden ? (
+          <Button label="恢复默认" onPress={onReset} styles={styles} disabled={disabled} />
+        ) : null}
+        <Button
+          label="应用参数"
+          onPress={() => {
+            const result = parsedParameters();
+            if (!result.parameters) {
+              setError(result.error ?? "能力参数无效");
+              return;
+            }
+            onSave(result.parameters, [...editedFields]);
+          }}
+          styles={styles}
+          primary
+          disabled={disabled || editedFields.size === 0}
+        />
+      </View>
     </View>
   );
 }
@@ -1663,7 +2216,10 @@ function PlanCard({
         <View style={styles.applyConfigurator}>
           <View>
             <Text style={styles.sectionTitle}>接入到 {TARGET_LABELS[applyDraft.target]}</Text>
-            <Text style={styles.muted}>模型仅用于本次配置写入，不会保存到 Coding Plan。</Text>
+            <Text style={styles.muted}>模型和调整后的能力参数仅用于本次配置写入，不会保存到 Coding Plan。</Text>
+            {plan.provider === "codex" ? (
+              <Text style={styles.muted}>ChatGPT 模型能力由目标工具的内置目录管理，本插件不会覆盖。</Text>
+            ) : null}
           </View>
           <View style={styles.modelSelector}>
             <Text style={styles.fieldLabel}>候选模型</Text>
@@ -1691,46 +2247,113 @@ function PlanCard({
                   const selectedIndex = applyDraft.models.indexOf(model);
                   const selected = selectedIndex >= 0;
                   const selectionDisabled = Boolean(applying) || (!selected && applyDraft.models.length >= 16);
+                  const capabilityProvider = plan.provider === "codex" ? undefined : plan.provider;
+                  const defaultParameters = capabilityProvider
+                    ? targetModelCapabilityParameters(capabilityProvider, applyDraft.target, model)
+                    : undefined;
+                  const override = modelOverride(applyDraft.modelParameters, model);
+                  const editing = applyDraft.editingModel === model;
                   return (
-                    <View key={model} style={styles.modelOption}>
-                      <Pressable
-                        accessibilityRole="checkbox"
-                        accessibilityState={{ checked: selected, disabled: selectionDisabled }}
-                        aria-checked={selected}
-                        disabled={selectionDisabled}
-                        onPress={() => {
-                          const models = selected
-                            ? applyDraft.models.filter((candidate) => candidate !== model)
-                            : [...applyDraft.models, model];
-                          onChangeApplyDraft({ ...applyDraft, models });
-                        }}
-                        style={({ pressed }) => [
-                          styles.modelOptionToggle,
-                          selectionDisabled && styles.buttonDisabled,
-                          pressed && !selectionDisabled && styles.buttonPressed,
-                        ]}
-                      >
-                        <View style={[styles.modelCheckbox, selected && styles.modelCheckboxSelected]}>
-                          {selected ? <Text style={styles.modelCheckboxText}>✓</Text> : null}
-                        </View>
-                        <Text style={styles.modelOptionLabel}>{model}</Text>
-                        {selectedIndex === 0 ? <Text style={styles.modelDefault}>默认</Text> : null}
-                      </Pressable>
-                      {selectedIndex > 0 ? (
+                    <React.Fragment key={model}>
+                      <View style={styles.modelOption}>
                         <Pressable
-                          accessibilityRole="button"
-                          accessibilityLabel={`将 ${model} 设为默认模型`}
-                          disabled={Boolean(applying)}
-                          onPress={() => onChangeApplyDraft({
-                            ...applyDraft,
-                            models: [model, ...applyDraft.models.filter((candidate) => candidate !== model)],
-                          })}
-                          style={({ pressed }) => [styles.modelDefaultAction, pressed && styles.buttonPressed]}
+                          accessibilityRole="checkbox"
+                          accessibilityState={{ checked: selected, disabled: selectionDisabled }}
+                          aria-checked={selected}
+                          disabled={selectionDisabled}
+                          onPress={() => {
+                            const models = selected
+                              ? applyDraft.models.filter((candidate) => candidate !== model)
+                              : [...applyDraft.models, model];
+                            onChangeApplyDraft({ ...applyDraft, models });
+                          }}
+                          style={({ pressed }) => [
+                            styles.modelOptionToggle,
+                            selectionDisabled && styles.buttonDisabled,
+                            pressed && !selectionDisabled && styles.buttonPressed,
+                          ]}
                         >
-                          <Text style={styles.modelDefaultActionText}>设为默认</Text>
+                          <View style={[styles.modelCheckbox, selected && styles.modelCheckboxSelected]}>
+                            {selected ? <Text style={styles.modelCheckboxText}>✓</Text> : null}
+                          </View>
+                          <Text style={styles.modelOptionLabel}>{model}</Text>
+                          {selectedIndex === 0 ? <Text style={styles.modelDefault}>默认</Text> : null}
                         </Pressable>
+                        <View style={styles.modelOptionActions}>
+                          {override ? <Text style={styles.modelParameterEdited}>已调整</Text> : null}
+                          <Pressable
+                            accessibilityRole="button"
+                            accessibilityLabel={capabilityProvider
+                              ? `${editing ? "收起" : "编辑"} ${model} 接入参数`
+                              : `${model} 使用目标工具内置参数`}
+                            accessibilityState={{ disabled: Boolean(applying) || !capabilityProvider }}
+                            disabled={Boolean(applying) || !capabilityProvider}
+                            onPress={() => onChangeApplyDraft({
+                              ...applyDraft,
+                              editingModel: editing ? undefined : model,
+                            })}
+                            style={({ pressed }) => [
+                              styles.modelParameterAction,
+                              editing && styles.modelParameterActionActive,
+                              !capabilityProvider && styles.buttonDisabled,
+                              pressed && capabilityProvider && styles.buttonPressed,
+                            ]}
+                          >
+                            <Text style={[
+                              styles.modelParameterActionText,
+                              editing && styles.modelParameterActionTextActive,
+                            ]}>
+                              {capabilityProvider ? (editing ? "收起" : "参数") : "工具内置"}
+                            </Text>
+                          </Pressable>
+                          {selectedIndex > 0 ? (
+                            <Pressable
+                              accessibilityRole="button"
+                              accessibilityLabel={`将 ${model} 设为默认模型`}
+                              disabled={Boolean(applying)}
+                              onPress={() => onChangeApplyDraft({
+                                ...applyDraft,
+                                models: [model, ...applyDraft.models.filter((candidate) => candidate !== model)],
+                              })}
+                              style={({ pressed }) => [styles.modelDefaultAction, pressed && styles.buttonPressed]}
+                            >
+                              <Text style={styles.modelDefaultActionText}>设为默认</Text>
+                            </Pressable>
+                          ) : null}
+                        </View>
+                      </View>
+                      {editing && capabilityProvider && defaultParameters ? (
+                        <ModelParameterEditor
+                          key={`${applyDraft.target}-${model}-${override ? "override" : "default"}`}
+                          provider={capabilityProvider}
+                          target={applyDraft.target}
+                          model={model}
+                          parameters={override?.parameters ?? defaultParameters}
+                          defaults={defaultParameters}
+                          fields={override?.fields ?? []}
+                          overridden={Boolean(override)}
+                          disabled={Boolean(applying)}
+                          styles={styles}
+                          placeholderColor={placeholderColor}
+                          onSave={(parameters, fields) => onChangeApplyDraft({
+                            ...applyDraft,
+                            modelParameters: [
+                              ...applyDraft.modelParameters.filter((candidate) => candidate.model !== model),
+                              { model, parameters, fields },
+                            ],
+                            editingModel: undefined,
+                          })}
+                          onReset={() => onChangeApplyDraft({
+                            ...applyDraft,
+                            modelParameters: applyDraft.modelParameters.filter(
+                              (candidate) => candidate.model !== model,
+                            ),
+                            editingModel: undefined,
+                          })}
+                          onCancel={() => onChangeApplyDraft({ ...applyDraft, editingModel: undefined })}
+                        />
                       ) : null}
-                    </View>
+                    </React.Fragment>
                   );
                 })}
                 <Field
@@ -2316,6 +2939,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
                       planId: plan.id,
                       target,
                       models: [defaultModelFor(plan.provider, target)],
+                      modelParameters: [],
                       customModel: "",
                       pickerOpen: true,
                     });
@@ -2323,10 +2947,14 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
                   onChangeApplyDraft={setApplyDraft}
                   onConfirmApply={() => {
                     if (applyDraft?.planId === plan.id) {
+                      const modelParameters = applyDraft.modelParameters.filter((override) => (
+                        applyDraft.models.includes(override.model)
+                      ));
                       applyMutation.mutate({
                         planId: applyDraft.planId,
                         target: applyDraft.target,
                         models: applyDraft.models,
+                        ...(modelParameters.length ? { modelParameters } : {}),
                       });
                     }
                   }}

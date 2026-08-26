@@ -1,5 +1,10 @@
 import { defineRpc } from "@getpaseo/plugin/server";
 import { z } from "zod";
+import {
+  CLAUDE_AUTO_COMPACT_MAX,
+  isKnownCapabilityModel,
+  ModelParameterOverrideSchema,
+} from "./model-capabilities.shared";
 
 export const ProviderSchema = z.enum(["codex", "zhipu", "kimi"]);
 export const TargetSchema = z.enum(["opencode", "codex", "claude"]);
@@ -140,6 +145,72 @@ export const ApplyPlanInputSchema = z.object({
     .min(1)
     .max(16)
     .transform((models) => [...new Set(models)]),
+  modelParameters: z.array(ModelParameterOverrideSchema).max(16).optional(),
+}).superRefine((input, context) => {
+  const supportedFields = input.target === "codex"
+    ? new Set(["limit.context", "modalities.input", "reasoning"])
+    : input.target === "claude"
+      ? new Set(["limit.context"])
+      : undefined;
+  const seen = new Set<string>();
+  for (const [index, override] of (input.modelParameters ?? []).entries()) {
+    const editedFields = new Set(override.fields);
+    if (!input.models.includes(override.model)) {
+      context.addIssue({
+        code: "custom",
+        path: ["modelParameters", index, "model"],
+        message: "Model parameters can only target a selected model",
+      });
+    }
+    if (seen.has(override.model)) {
+      context.addIssue({
+        code: "custom",
+        path: ["modelParameters", index, "model"],
+        message: "Model parameters cannot contain duplicate models",
+      });
+    }
+    for (const [fieldIndex, field] of override.fields.entries()) {
+      if (supportedFields && !supportedFields.has(field)) {
+        context.addIssue({
+          code: "custom",
+          path: ["modelParameters", index, "fields", fieldIndex],
+          message: `${input.target} does not map the ${field} capability field`,
+        });
+      }
+    }
+    if (
+      input.target === "claude" &&
+      override.model.endsWith("[1m]") &&
+      override.parameters.limit.context > CLAUDE_AUTO_COMPACT_MAX
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["modelParameters", index, "parameters", "limit", "context"],
+        message: "Claude [1m] model IDs have a fixed 1000000 token context",
+      });
+    }
+    if (input.target === "codex" && isKnownCapabilityModel("zhipu", override.model)) {
+      if (editedFields.has("reasoning") && !override.parameters.reasoning) {
+        context.addIssue({
+          code: "custom",
+          path: ["modelParameters", index, "parameters", "reasoning"],
+          message: `${override.model} requires reasoning in Codex`,
+        });
+      }
+      if (
+        editedFields.has("modalities.input") &&
+        (override.parameters.modalities.input.length !== 1 ||
+          override.parameters.modalities.input[0] !== "text")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["modelParameters", index, "parameters", "modalities", "input"],
+          message: `${override.model} only supports text input in Codex`,
+        });
+      }
+    }
+    seen.add(override.model);
+  }
 });
 
 export const getDashboard = defineRpc({

@@ -32,6 +32,15 @@ export async function handleRefreshUsage({ planId }: { planId?: string }) {
   return { usage: await refreshUsageSnapshots(planId) };
 }
 
-export async function handleApplyPlan({ planId, target, models }: ApplyPlanInput) {
-  return applyPlanToTarget(planId, target, models);
+export async function handleApplyPlan({ planId, target, models, modelParameters }: ApplyPlanInput) {
+  return applyPlanToTarget(
+    planId,
+    target,
+    models,
+    planStore,
+    new Map(modelParameters?.map((override) => [override.model, {
+      parameters: override.parameters,
+      fields: override.fields,
+    }])),
+  );
 }

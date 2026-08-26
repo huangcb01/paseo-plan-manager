@@ -13,6 +13,11 @@ import {
   patchOpenCodeConfig,
   applyPlanToTarget,
 } from "../config.server";
+import {
+  modelCapabilityParameters,
+  type ModelCapabilityField,
+  type ModelCapabilityParameters,
+} from "../model-capabilities.shared";
 import type { Plan } from "../plans.shared";
 import { PlanStore, type PlanSecret } from "../store.server";
 
@@ -27,6 +32,13 @@ function plan(provider: Plan["provider"]): Plan {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
   };
+}
+
+function modelPatch(
+  parameters: ModelCapabilityParameters,
+  fields: ModelCapabilityField[],
+) {
+  return { parameters, fields };
 }
 
 test("patches one multi-model OpenCode provider while preserving comments and unrelated providers", () => {
@@ -178,6 +190,198 @@ test("writes model-specific OpenCode limits and modalities", () => {
   });
 });
 
+test("applies explicit per-model OpenCode capabilities and clears optional fields", () => {
+  const source = JSON.stringify({
+    provider: {
+      kimi: {
+        models: {
+          "kimi-for-coding": {
+            limit: { context: 1, input: 1, output: 1 },
+            interleaved: { field: "reasoning_content" },
+          },
+        },
+      },
+    },
+  });
+  const parameters = modelCapabilityParameters("kimi", "kimi-for-coding");
+  parameters.limit = { context: 300_000, output: 50_000 };
+  parameters.modalities = { input: ["text", "pdf"], output: ["text", "image"] };
+  parameters.reasoning = false;
+  parameters.attachment = false;
+  parameters.toolCall = false;
+  parameters.temperature = true;
+  parameters.interleaved = null;
+
+  const parsed = JSON.parse(patchOpenCodeConfig(
+    source,
+    plan("kimi"),
+    ["kimi-for-coding"],
+    new Map([["kimi-for-coding", modelPatch(parameters, [
+      "limit.context",
+      "limit.input",
+      "limit.output",
+      "modalities.input",
+      "modalities.output",
+      "reasoning",
+      "attachment",
+      "toolCall",
+      "temperature",
+      "interleaved",
+    ])]]),
+  ));
+  const model = parsed.provider.kimi.models["kimi-for-coding"];
+  assert.deepEqual(model.limit, { context: 300_000, output: 50_000 });
+  assert.deepEqual(model.modalities, { input: ["text", "pdf"], output: ["text", "image"] });
+  assert.equal(model.reasoning, false);
+  assert.equal(model.attachment, false);
+  assert.equal(model.tool_call, false);
+  assert.equal(model.temperature, true);
+  assert.equal(model.interleaved, undefined);
+});
+
+test("changes only explicitly edited fields on an existing unknown OpenCode model", () => {
+  const source = JSON.stringify({
+    provider: {
+      kimi: {
+        models: {
+          "private-kimi": {
+            name: "Private display name",
+            limit: { context: 111_000, input: 100_000, output: 11_000, vendor: "keep" },
+            modalities: { input: ["text", "pdf"], output: ["text", "audio"] },
+            reasoning: false,
+            attachment: true,
+            tool_call: false,
+            temperature: true,
+            interleaved: { field: "reasoning" },
+            vendor: { keep: true },
+          },
+        },
+      },
+    },
+  });
+  const parameters = modelCapabilityParameters("kimi", "private-kimi");
+
+  const parsed = JSON.parse(patchOpenCodeConfig(
+    source,
+    plan("kimi"),
+    ["private-kimi"],
+    new Map([["private-kimi", modelPatch(parameters, [
+      "limit.context",
+      "limit.input",
+      "reasoning",
+      "interleaved",
+    ])]]),
+  ));
+  assert.deepEqual(parsed.provider.kimi.models["private-kimi"], {
+    name: "Private display name",
+    limit: { context: 262_144, output: 11_000, vendor: "keep" },
+    modalities: { input: ["text", "pdf"], output: ["text", "audio"] },
+    reasoning: true,
+    attachment: true,
+    tool_call: false,
+    temperature: true,
+    vendor: { keep: true },
+  });
+});
+
+test("rejects an unknown OpenCode limit patch that conflicts with preserved fields", () => {
+  const source = JSON.stringify({
+    provider: {
+      kimi: {
+        models: {
+          "private-kimi": { limit: { context: 100_000, output: 50_000 } },
+        },
+      },
+    },
+  });
+  const parameters = modelCapabilityParameters("kimi", "private-kimi");
+  parameters.limit.output = 200_000;
+
+  assert.throws(
+    () => patchOpenCodeConfig(
+      source,
+      plan("kimi"),
+      ["private-kimi"],
+      new Map([["private-kimi", modelPatch(parameters, ["limit.output"])]]),
+    ),
+    /after applying edited fields\.output cannot exceed context/,
+  );
+});
+
+test("validates sparse OpenCode limits against preserved or completed fields", () => {
+  const withLargeContext = JSON.stringify({
+    provider: { kimi: { models: { "private-kimi": { limit: { context: 1_000_000, output: 50_000 } } } } },
+  });
+  const outputParameters = modelCapabilityParameters("kimi", "private-kimi");
+  outputParameters.limit.output = 500_000;
+  const updated = JSON.parse(patchOpenCodeConfig(
+    withLargeContext,
+    plan("kimi"),
+    ["private-kimi"],
+    new Map([["private-kimi", modelPatch(outputParameters, ["limit.output"])]]),
+  ));
+  assert.deepEqual(updated.provider.kimi.models["private-kimi"].limit, {
+    context: 1_000_000,
+    output: 500_000,
+  });
+
+  const withoutLimit = JSON.stringify({
+    provider: { kimi: { models: { "private-kimi": { vendor: "keep" } } } },
+  });
+  const contextParameters = modelCapabilityParameters("kimi", "private-kimi");
+  contextParameters.limit.context = 300_000;
+  const completed = JSON.parse(patchOpenCodeConfig(
+    withoutLimit,
+    plan("kimi"),
+    ["private-kimi"],
+    new Map([["private-kimi", modelPatch(contextParameters, ["limit.context"])]]),
+  ));
+  assert.deepEqual(completed.provider.kimi.models["private-kimi"], {
+    vendor: "keep",
+    limit: { context: 300_000, output: 32_768 },
+  });
+});
+
+test("maps supported custom-model capabilities into the Codex model catalog", () => {
+  const parameters = modelCapabilityParameters("zhipu", "private-glm");
+  parameters.limit.context = 500_000;
+  parameters.modalities.input = ["text", "image", "video"];
+  parameters.reasoning = false;
+
+  const catalog = JSON.parse(codexModelCatalog(
+    ["private-glm"],
+    new Map([["private-glm", modelPatch(parameters, [
+      "limit.context",
+      "modalities.input",
+      "reasoning",
+    ])]]),
+  ));
+  const [model] = catalog.models;
+  assert.equal(model.context_window, 500_000);
+  assert.equal(model.max_context_window, 500_000);
+  assert.deepEqual(model.input_modalities, ["text", "image"]);
+  assert.equal(model.default_reasoning_level, undefined);
+  assert.deepEqual(model.supported_reasoning_levels, []);
+  assert.equal(model.supports_reasoning_summary_parameter, false);
+  assert.equal(model.supports_reasoning_summaries, undefined);
+  assert.equal(model.shell_type, "shell_command");
+  assert.equal(model.apply_patch_tool_type, "freeform");
+  assert.equal(model.supports_parallel_tool_calls, undefined);
+});
+
+test("uses only declared dirty fields when generating a Codex model entry", () => {
+  const parameters = modelCapabilityParameters("zhipu", "private-glm");
+  parameters.limit.context = 100_000_000;
+  parameters.reasoning = false;
+  const catalog = JSON.parse(codexModelCatalog(
+    ["private-glm"],
+    new Map([["private-glm", modelPatch(parameters, ["reasoning"])]]),
+  ));
+
+  assert.equal(catalog.models[0].context_window, 204_800);
+  assert.equal(catalog.models[0].default_reasoning_level, undefined);
+});
+
 test("leaves the OpenCode built-in OpenAI catalog untouched for Codex OAuth", () => {
   const source = '{"provider":{"openai":{"models":{"official":{"name":"Official"}}}}}';
   const parsed = JSON.parse(patchOpenCodeConfig(source, plan("codex"), ["gpt-default", "gpt-extra"]));
@@ -192,6 +396,64 @@ test("rejects invalid model lists from direct apply callers", async () => {
     /more than 16 models/,
   );
   await assert.rejects(applyPlanToTarget("unused", "opencode", ["x".repeat(257)]), /256 characters/);
+  await assert.rejects(
+    applyPlanToTarget(
+      "unused",
+      "opencode",
+      ["kimi-for-coding"],
+      undefined,
+      new Map([["k3", modelPatch(modelCapabilityParameters("kimi", "k3"), ["limit.context"])]]),
+    ),
+    /only target a selected model/,
+  );
+  const claudeParameters = modelCapabilityParameters("zhipu", "glm-5.3[1m]");
+  claudeParameters.limit.context = 1_100_000;
+  await assert.rejects(
+    applyPlanToTarget(
+      "unused",
+      "claude",
+      ["glm-5.3[1m]"],
+      undefined,
+      new Map([["glm-5.3[1m]", modelPatch(claudeParameters, ["limit.context"])]]),
+    ),
+    /fixed 1000000 token context/,
+  );
+  const codexParameters = modelCapabilityParameters("zhipu", "glm-5.3");
+  codexParameters.toolCall = false;
+  await assert.rejects(
+    applyPlanToTarget(
+      "unused",
+      "codex",
+      ["glm-5.3"],
+      undefined,
+      new Map([["glm-5.3", modelPatch(codexParameters, ["toolCall"])]]),
+    ),
+    /does not map the toolCall capability field/,
+  );
+  const noReasoning = modelCapabilityParameters("zhipu", "glm-5.3");
+  noReasoning.reasoning = false;
+  await assert.rejects(
+    applyPlanToTarget(
+      "unused",
+      "codex",
+      ["glm-5.3"],
+      undefined,
+      new Map([["glm-5.3", modelPatch(noReasoning, ["reasoning"])]]),
+    ),
+    /requires reasoning in Codex/,
+  );
+  const multimodal = modelCapabilityParameters("zhipu", "glm-5.3");
+  multimodal.modalities.input = ["text", "image"];
+  await assert.rejects(
+    applyPlanToTarget(
+      "unused",
+      "codex",
+      ["glm-5.3"],
+      undefined,
+      new Map([["glm-5.3", modelPatch(multimodal, ["modalities.input"])]]),
+    ),
+    /only supports text input in Codex/,
+  );
 });
 
 test("patches OpenCode auth without deleting another provider", () => {
@@ -255,11 +517,37 @@ base_url = "https://old.example"
   assert.equal((output.match(/BEGIN paseo-coding-plan-manager/g) ?? []).length, 1);
 });
 
+test("removes a root reasoning effort for a custom non-reasoning Codex model", () => {
+  const parameters = modelCapabilityParameters("zhipu", "private-glm");
+  parameters.reasoning = false;
+  for (const key of ["model_reasoning_effort", '"model_reasoning_effort"', "'model_reasoning_effort'"]) {
+    const output = patchCodexConfig(
+      `${key} = "high"\n`,
+      plan("zhipu"),
+      ["private-glm"],
+      {
+        apiKey: "zai-secret",
+        modelCatalogPath: "/tmp/models.json",
+        modelParameters: new Map([["private-glm", modelPatch(parameters, ["reasoning"])]]),
+      },
+    );
+    assert.doesNotMatch(output, /model_reasoning_effort/);
+  }
+});
+
 test("writes every selected Zhipu model with its Codex catalog metadata", () => {
-  const catalog = JSON.parse(codexModelCatalog(["glm-5.3", "glm-5.2", "glm-5.3"]));
-  assert.deepEqual(catalog.models.map((model: Record<string, unknown>) => model.slug), ["glm-5.3", "glm-5.2"]);
+  const catalog = JSON.parse(codexModelCatalog(["glm-5.3", "glm-5-turbo", "glm-5.3"]));
+  assert.deepEqual(catalog.models.map((model: Record<string, unknown>) => model.slug), ["glm-5.3", "glm-5-turbo"]);
   assert.equal(catalog.models[0].context_window, 1_048_576);
   assert.equal(catalog.models[1].context_window, 204_800);
+  assert.equal(catalog.models[0].default_reasoning_level, "max");
+  assert.deepEqual(
+    catalog.models[0].supported_reasoning_levels.map((level: Record<string, unknown>) => level.effort),
+    ["low", "high", "max"],
+  );
+  assert.equal(catalog.models[1].default_reasoning_level, "max");
+  assert.deepEqual(catalog.models[1].supported_reasoning_levels, []);
+  assert.equal(catalog.models[0].supports_reasoning_summary_parameter, true);
 });
 
 test("patches only Claude env and keeps unrelated settings", () => {
@@ -300,11 +588,54 @@ test("patches only Claude env and keeps unrelated settings", () => {
   ]);
 });
 
-test("uses the 1M Kimi context only when every selected model supports it", () => {
+test("keeps Claude model capacity separate from its 1M auto-compact ceiling", () => {
+  const k3Only = JSON.parse(patchClaudeSettings(undefined, plan("kimi"), "secret", ["k3"]));
   const allLarge = JSON.parse(patchClaudeSettings(undefined, plan("kimi"), "secret", ["k3", "k3[1m]"]));
   const mixed = JSON.parse(patchClaudeSettings(undefined, plan("kimi"), "secret", ["k3", "kimi-for-coding"]));
-  assert.equal(allLarge.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1048576");
+  const glmLarge = JSON.parse(patchClaudeSettings(undefined, plan("zhipu"), "secret", ["glm-5.3[1m]"]));
+  assert.equal(k3Only.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1048576");
+  assert.equal(k3Only.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
+  assert.equal(allLarge.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1000000");
+  assert.equal(allLarge.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
   assert.equal(mixed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "262144");
+  assert.equal(glmLarge.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1000000");
+  assert.equal(glmLarge.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
+});
+
+test("allows a sub-100K Claude model while clamping its configured compact window", () => {
+  const parameters = modelCapabilityParameters("kimi", "private-kimi");
+  parameters.limit.context = 64_000;
+  const parsed = JSON.parse(patchClaudeSettings(
+    undefined,
+    plan("kimi"),
+    "secret",
+    ["private-kimi"],
+    new Map([["private-kimi", modelPatch(parameters, ["limit.context"])]]),
+  ));
+
+  assert.equal(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "64000");
+  assert.equal(parsed.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "100000");
+});
+
+test("maps per-model context overrides to Claude's smallest global context", () => {
+  const k3 = modelCapabilityParameters("kimi", "k3");
+  const coding = modelCapabilityParameters("kimi", "kimi-for-coding");
+  k3.limit.context = 900_000;
+  coding.limit.context = 180_000;
+  coding.limit.output = 32_000;
+  const parsed = JSON.parse(patchClaudeSettings(
+    undefined,
+    plan("kimi"),
+    "secret",
+    ["k3", "kimi-for-coding"],
+    new Map([
+      ["k3", modelPatch(k3, ["limit.context"])],
+      ["kimi-for-coding", modelPatch(coding, ["limit.context"])],
+    ]),
+  ));
+
+  assert.equal(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "180000");
+  assert.equal(parsed.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "180000");
 });
 
 test("removes stale generated Claude models when switching providers", () => {
