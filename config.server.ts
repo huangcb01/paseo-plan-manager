@@ -11,6 +11,17 @@ import {
 import { parse as parseToml } from "smol-toml";
 import type { Plan, Target } from "./plans.shared";
 import {
+  CLAUDE_AUTO_COMPACT_MIN,
+  CLAUDE_AUTO_COMPACT_MAX,
+  isKnownCapabilityModel,
+  modelCapabilityParameters,
+  ModelParameterOverrideSchema,
+  targetModelCapabilityParameters,
+  type CapabilityProvider,
+  type ModelCapabilityParameters,
+  type ModelParameterPatch,
+} from "./model-capabilities.shared";
+import {
   atomicWriteFile,
   captureFile,
   expandHome,
@@ -64,126 +75,31 @@ interface ProviderProjection {
   codex: { baseUrl: string };
   claude: {
     baseUrl: string;
-    contextTokens: string;
     apiKeyField: "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN";
   };
 }
 
-type ApiKeyProvider = Exclude<Plan["provider"], "codex">;
-type OpenCodeInputModality = "text" | "image" | "video" | "pdf";
+type ApiKeyProvider = CapabilityProvider;
 
-interface ModelCapabilities {
-  context: number;
-  output: number;
-  input: readonly OpenCodeInputModality[];
-  attachment: boolean;
-  temperature: boolean;
-  interleaved?: "reasoning_content";
-}
-
-// OpenCode consumes these records from models.dev for its built-in model catalog.
-const DEFAULT_MODEL_CAPABILITIES: Record<ApiKeyProvider, ModelCapabilities> = {
-  zhipu: {
-    context: 204_800,
-    output: 131_072,
-    input: ["text"],
-    attachment: false,
-    temperature: true,
-    interleaved: "reasoning_content",
-  },
-  kimi: { context: 262_144, output: 32_768, input: ["text"], attachment: false, temperature: false },
-};
-
-const MODEL_CAPABILITIES: Record<ApiKeyProvider, Record<string, ModelCapabilities>> = {
-  zhipu: {
-    "glm-5.1": {
-      context: 200_000,
-      output: 131_072,
-      input: ["text"],
-      attachment: false,
-      temperature: true,
-      interleaved: "reasoning_content",
-    },
-    "glm-5.3": {
-      context: 1_000_000,
-      output: 131_072,
-      input: ["text"],
-      attachment: false,
-      temperature: true,
-      interleaved: "reasoning_content",
-    },
-    "glm-5-turbo": {
-      context: 200_000,
-      output: 131_072,
-      input: ["text"],
-      attachment: false,
-      temperature: true,
-      interleaved: "reasoning_content",
-    },
-    "glm-4.7": {
-      context: 204_800,
-      output: 131_072,
-      input: ["text"],
-      attachment: false,
-      temperature: true,
-      interleaved: "reasoning_content",
-    },
-  },
-  kimi: {
-    "kimi-for-coding": {
-      context: 262_144,
-      output: 32_768,
-      input: ["text", "image", "video"],
-      attachment: true,
-      temperature: false,
-    },
-    "kimi-for-coding-highspeed": {
-      context: 262_144,
-      output: 32_768,
-      input: ["text", "image", "video"],
-      attachment: true,
-      temperature: false,
-    },
-    k3: {
-      context: 1_048_576,
-      output: 131_072,
-      input: ["text", "image", "video"],
-      attachment: false,
-      temperature: false,
-    },
-    "k3-256k": {
-      context: 262_144,
-      output: 131_072,
-      input: ["text", "image"],
-      attachment: false,
-      temperature: false,
-    },
-  },
-};
-
-function canonicalPlanModel(provider: ApiKeyProvider, model: string): string {
-  const withoutContextSuffix = model.endsWith("[1m]") ? model.slice(0, -4) : model;
-  return Object.hasOwn(MODEL_CAPABILITIES[provider], withoutContextSuffix)
-    ? withoutContextSuffix
-    : model;
-}
-
-function isKnownPlanModel(provider: ApiKeyProvider, model: string): boolean {
-  return Object.hasOwn(MODEL_CAPABILITIES[provider], canonicalPlanModel(provider, model));
-}
-
-function openCodeModelDefinition(provider: ApiKeyProvider, model: string): Record<string, unknown> {
-  const canonical = canonicalPlanModel(provider, model);
-  const capabilities = Object.hasOwn(MODEL_CAPABILITIES[provider], canonical)
-    ? MODEL_CAPABILITIES[provider][canonical]
-    : DEFAULT_MODEL_CAPABILITIES[provider];
+function openCodeModelDefinition(
+  provider: ApiKeyProvider,
+  model: string,
+  capabilities: ModelCapabilityParameters = modelCapabilityParameters(provider, model),
+): Record<string, unknown> {
   return {
     name: model,
-    limit: { context: capabilities.context, output: capabilities.output },
-    modalities: { input: [...capabilities.input], output: ["text"] },
-    reasoning: true,
+    limit: {
+      context: capabilities.limit.context,
+      ...(capabilities.limit.input !== undefined ? { input: capabilities.limit.input } : {}),
+      output: capabilities.limit.output,
+    },
+    modalities: {
+      input: [...capabilities.modalities.input],
+      output: [...capabilities.modalities.output],
+    },
+    reasoning: capabilities.reasoning,
     attachment: capabilities.attachment,
-    tool_call: true,
+    tool_call: capabilities.toolCall,
     temperature: capabilities.temperature,
     ...(capabilities.interleaved
       ? { interleaved: { field: capabilities.interleaved } }
@@ -193,6 +109,43 @@ function openCodeModelDefinition(provider: ApiKeyProvider, model: string): Recor
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateSparseOpenCodeLimit(
+  existingModel: Record<string, unknown>,
+  override: ModelCapabilityParameters,
+  editedFields: ReadonlySet<string>,
+  description: string,
+): void {
+  if (![...editedFields].some((field) => field.startsWith("limit."))) return;
+  const limit = isObject(existingModel.limit) ? { ...existingModel.limit } : {};
+  if (limit.context === undefined) limit.context = override.limit.context;
+  if (limit.output === undefined) limit.output = override.limit.output;
+  if (editedFields.has("limit.context")) limit.context = override.limit.context;
+  if (editedFields.has("limit.output")) limit.output = override.limit.output;
+  if (editedFields.has("limit.input")) {
+    if (override.limit.input === undefined) delete limit.input;
+    else limit.input = override.limit.input;
+  }
+
+  validateOpenCodeLimit(limit, `${description} after applying edited fields`);
+}
+
+function validateOpenCodeLimit(limit: Record<string, unknown>, description: string): void {
+  function token(field: "context" | "input" | "output", required = false): number | undefined {
+    const value = limit[field];
+    if (value === undefined && !required) return undefined;
+    if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > 100_000_000) {
+      throw new Error(`${description}.${field} must be a positive integer no greater than 100000000`);
+    }
+    return value;
+  }
+
+  const context = token("context", true) as number;
+  const input = token("input");
+  const output = token("output", true) as number;
+  if (output > context) throw new Error(`${description}.output cannot exceed context`);
+  if (input !== undefined && input > context) throw new Error(`${description}.input cannot exceed context`);
 }
 
 function nonEmpty(value: string, description: string): string {
@@ -228,7 +181,6 @@ export function providerProjection(plan: Plan): ProviderProjection {
       codex: { baseUrl: "https://api.kimi.com/coding/v1" },
       claude: {
         baseUrl: "https://api.kimi.com/coding/",
-        contextTokens: "262144",
         apiKeyField: "ANTHROPIC_API_KEY",
       },
     };
@@ -255,7 +207,6 @@ export function providerProjection(plan: Plan): ProviderProjection {
     },
     claude: {
       baseUrl: `https://${host}/api/anthropic`,
-      contextTokens: "200000",
       apiKeyField: "ANTHROPIC_AUTH_TOKEN",
     },
   };
@@ -290,7 +241,12 @@ function editJsonc(
   return result.endsWith(eol) ? result : `${result}${eol}`;
 }
 
-export function patchOpenCodeConfig(text: string | undefined, plan: Plan, selectedModels: readonly string[]): string {
+export function patchOpenCodeConfig(
+  text: string | undefined,
+  plan: Plan,
+  selectedModels: readonly string[],
+  modelParameters?: ReadonlyMap<string, ModelParameterPatch>,
+): string {
   const source = text?.trim() ? text : "{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}\n";
   const parsed = jsoncValue(source, "OpenCode config");
   if (parsed.provider !== undefined && !isObject(parsed.provider)) {
@@ -325,6 +281,13 @@ export function patchOpenCodeConfig(text: string | undefined, plan: Plan, select
     if (existingModel !== undefined && !isObject(existingModel)) {
       throw new Error(`OpenCode config.provider.${projection.providerId}.models.${candidate} must be an object`);
     }
+    if (isObject(existingModel)) {
+      for (const field of ["limit", "modalities"] as const) {
+        if (existingModel[field] !== undefined && !isObject(existingModel[field])) {
+          throw new Error(`OpenCode config.provider.${projection.providerId}.models.${candidate}.${field} must be an object`);
+        }
+      }
+    }
   }
 
   const changes: Array<{ path: (string | number)[]; value: unknown }> = [
@@ -336,24 +299,78 @@ export function patchOpenCodeConfig(text: string | undefined, plan: Plan, select
   ];
   for (const candidate of models) {
     const existingModel = isObject(existingModels[candidate]) ? existingModels[candidate] : undefined;
-    const knownModel = isKnownPlanModel(plan.provider, candidate);
-    for (const [field, value] of Object.entries(openCodeModelDefinition(plan.provider, candidate))) {
-      if (!knownModel && existingModel && Object.hasOwn(existingModel, field)) continue;
+    const parameterPatch = modelParameters?.get(candidate);
+    const override = parameterPatch?.parameters;
+    const editedFields = new Set<string>(parameterPatch?.fields ?? []);
+    const knownModel = isKnownCapabilityModel(plan.provider, candidate);
+    const managedModel = knownModel || override !== undefined;
+    const definition = openCodeModelDefinition(plan.provider, candidate, override);
+    const preserveCustomFields = Boolean(existingModel && parameterPatch && !knownModel);
+    if (preserveCustomFields && existingModel && override) {
+      validateSparseOpenCodeLimit(
+        existingModel,
+        override,
+        editedFields,
+        `OpenCode model ${candidate} limit`,
+      );
+    } else if (isObject(definition.limit)) {
+      validateOpenCodeLimit(definition.limit, `OpenCode model ${candidate} limit`);
+    }
+    for (const [field, value] of Object.entries(definition)) {
+      if (!managedModel && existingModel && Object.hasOwn(existingModel, field)) continue;
+      const capabilityField = field === "tool_call" ? "toolCall" : field;
       if (
-        knownModel &&
+        preserveCustomFields &&
+        field !== "limit" &&
+        field !== "modalities" &&
+        !editedFields.has(capabilityField)
+      ) continue;
+      if (
+        managedModel &&
         (field === "limit" || field === "modalities") &&
         isObject(value) &&
-        isObject(existingModel?.[field])
+        (isObject(existingModel?.[field]) || preserveCustomFields)
       ) {
+        const existingNested = isObject(existingModel?.[field]) ? existingModel[field] : {};
+        const groupEdited = [...editedFields].some((candidate) => candidate.startsWith(`${field}.`));
+        const requiredFields = field === "limit" ? ["context", "output"] : ["input", "output"];
         for (const [nestedField, nestedValue] of Object.entries(value)) {
+          const missingRequired = groupEdited &&
+            requiredFields.includes(nestedField) &&
+            !Object.hasOwn(existingNested, nestedField);
+          if (
+            preserveCustomFields &&
+            !editedFields.has(`${field}.${nestedField}`) &&
+            !missingRequired
+          ) continue;
           changes.push({
             path: ["provider", projection.providerId, "models", candidate, field, nestedField],
             value: nestedValue,
           });
         }
+        if (
+          field === "limit" &&
+          override &&
+          override.limit.input === undefined &&
+          (!preserveCustomFields || editedFields.has("limit.input"))
+        ) {
+          changes.push({
+            path: ["provider", projection.providerId, "models", candidate, "limit", "input"],
+            value: undefined,
+          });
+        }
         continue;
       }
       changes.push({ path: ["provider", projection.providerId, "models", candidate, field], value });
+    }
+    if (
+      override?.interleaved === null &&
+      (!preserveCustomFields || editedFields.has("interleaved"))
+    ) {
+      changes.push({
+        path: ["provider", projection.providerId, "models", candidate, "interleaved"],
+        value: undefined,
+      });
     }
   }
   changes.push({ path: ["model"], value: `${projection.providerId}/${model}` });
@@ -533,7 +550,10 @@ function upsertRootTomlKeys(
     const line = lines[index];
     let matched = false;
     for (const key of Object.keys(values)) {
-      if (new RegExp(`^\\s*${key}\\s*=`).test(line)) {
+      const bareKey = new RegExp(`^\\s*${key}\\s*=`).test(line);
+      const removableQuotedKey = values[key] === undefined &&
+        new RegExp(`^\\s*(?:"${key}"|'${key}')\\s*=`).test(line);
+      if (bareKey || removableQuotedKey) {
         if (values[key] !== undefined && remaining.has(key)) {
           prefix.push(`${key} = ${typeof values[key] === "boolean" ? values[key] : tomlString(String(values[key]))}`);
           remaining.delete(key);
@@ -557,7 +577,11 @@ export function patchCodexConfig(
   text: string | undefined,
   plan: Plan,
   selectedModels: readonly string[],
-  options: { apiKey?: string; modelCatalogPath?: string } = {},
+  options: {
+    apiKey?: string;
+    modelCatalogPath?: string;
+    modelParameters?: ReadonlyMap<string, ModelParameterPatch>;
+  } = {},
 ): string {
   const source = text ?? "";
   const parsedSource = tomlObject(source, "Codex config.toml");
@@ -586,10 +610,17 @@ export function patchCodexConfig(
     throw new Error("Z.AI Codex projection requires an API key and model catalog path");
   }
 
+  const defaultParameters = targetModelCapabilityParameters("zhipu", "codex", model);
+  const parameterPatch = options.modelParameters?.get(model);
+  const reasoning = parameterPatch?.fields.includes("reasoning")
+    ? parameterPatch.parameters.reasoning
+    : defaultParameters.reasoning;
+
   result = upsertRootTomlKeys(result, {
     model_provider: "paseo-coding-plan",
     model,
     model_catalog_json: options.modelCatalogPath,
+    ...(!reasoning ? { model_reasoning_effort: undefined } : {}),
   });
   const projection = providerProjection(plan);
   const block = [
@@ -639,7 +670,7 @@ function isLegacyGeneratedClaudeOption(
   return Object.keys(option).length === 2 &&
     option.label === option.model &&
     typeof option.model === "string" &&
-    isKnownPlanModel(previousProvider, option.model);
+    isKnownCapabilityModel(previousProvider, option.model);
 }
 
 function isManagedClaudeOption(option: Record<string, unknown>): boolean {
@@ -651,10 +682,12 @@ export function patchClaudeSettings(
   plan: Plan,
   apiKey: string,
   selectedModels: readonly string[],
+  modelParameters?: ReadonlyMap<string, ModelParameterPatch>,
 ): string {
   if (plan.provider === "codex") {
     throw new Error("Claude Code cannot use a ChatGPT Codex OAuth plan without a protocol-conversion proxy");
   }
+  const capabilityProvider = plan.provider;
   const settings = text?.trim() ? parseJsonObject(text, "Claude settings.json") : {};
   if (settings.env !== undefined && !isObject(settings.env)) {
     throw new Error("Claude settings.json env must be an object");
@@ -667,9 +700,22 @@ export function patchClaudeSettings(
   const projection = providerProjection(plan);
   const models = normalizeModels(selectedModels, "Claude models");
   const model = models[0];
-  const contextTokens = plan.provider === "kimi" && models.every((candidate) => /^(k3|k3\[1m\])$/.test(candidate))
-    ? "1048576"
-    : projection.claude.contextTokens;
+  const modelContexts = models.map((candidate) => ({
+    model: candidate,
+    context: modelParameters?.get(candidate)?.parameters.limit.context ??
+      targetModelCapabilityParameters(capabilityProvider, "claude", candidate).limit.context,
+  }));
+  for (const candidate of modelContexts) {
+    if (candidate.model.endsWith("[1m]") && candidate.context > CLAUDE_AUTO_COMPACT_MAX) {
+      throw new Error("Claude [1m] model IDs have a fixed 1000000 token context");
+    }
+  }
+  const contextValue = Math.min(...modelContexts.map((candidate) => candidate.context));
+  const contextTokens = String(contextValue);
+  const autoCompactTokens = String(Math.min(
+    Math.max(contextValue, CLAUDE_AUTO_COMPACT_MIN),
+    CLAUDE_AUTO_COMPACT_MAX,
+  ));
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;
   const providerEnvironment: Record<string, string> = {
@@ -682,7 +728,7 @@ export function patchClaudeSettings(
     CLAUDE_CODE_SUBAGENT_MODEL: model,
     CLAUDE_CODE_EFFORT_LEVEL: "high",
     CLAUDE_CODE_MAX_CONTEXT_TOKENS: contextTokens,
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW: contextTokens,
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: autoCompactTokens,
   };
   providerEnvironment[projection.claude.apiKeyField] = apiKey;
   Object.assign(env, providerEnvironment);
@@ -737,27 +783,52 @@ export function patchClaudeState(text: string | undefined, plan: Plan): string {
   return `${JSON.stringify(state, null, 2)}\n`;
 }
 
-export function codexModelCatalog(selectedModels: readonly string[]): string {
+export function codexModelCatalog(
+  selectedModels: readonly string[],
+  modelParameters?: ReadonlyMap<string, ModelParameterPatch>,
+): string {
   const models = normalizeModels(selectedModels, "Codex models");
   return `${JSON.stringify({
-    models: models.map((model) => {
-      const contextWindow = model === "glm-5.3" ? 1_048_576 : 204_800;
+    models: models.map((model, priority) => {
+      const parameterPatch = modelParameters?.get(model);
+      const override = parameterPatch?.parameters;
+      const editedFields = new Set(parameterPatch?.fields ?? []);
+      const defaults = targetModelCapabilityParameters("zhipu", "codex", model);
+      const reasoning = editedFields.has("reasoning") && override
+        ? override.reasoning
+        : defaults.reasoning;
+      const inputModalities = editedFields.has("modalities.input") && override
+        ? override.modalities.input.filter((modality) => (
+            modality === "text" || modality === "image" || modality === "audio"
+          ))
+        : defaults.modalities.input;
+      if (isKnownCapabilityModel("zhipu", model)) {
+        if (!reasoning) throw new Error(`${model} requires reasoning in Codex`);
+        if (inputModalities.length !== 1 || inputModalities[0] !== "text") {
+          throw new Error(`${model} only supports text input in Codex`);
+        }
+      }
+      const contextWindow = editedFields.has("limit.context") && override
+        ? override.limit.context
+        : defaults.limit.context;
       return {
         slug: model,
         display_name: model,
         description: "Z.AI GLM Coding Plan",
-        default_reasoning_level: "high",
-        supported_reasoning_levels: [
-          { effort: "low", description: "Light reasoning" },
-          { effort: "high", description: "Enhanced reasoning" },
-          { effort: "max", description: "Deep reasoning" },
-        ],
+        ...(reasoning ? { default_reasoning_level: "max" } : {}),
+        supported_reasoning_levels: reasoning && model === "glm-5.3"
+          ? [
+              { effort: "low", description: "Light reasoning" },
+              { effort: "high", description: "Enhanced reasoning" },
+              { effort: "max", description: "Deep reasoning" },
+            ]
+          : [],
         shell_type: "shell_command",
         visibility: "list",
         supported_in_api: true,
-        priority: 0,
+        priority,
         base_instructions: "",
-        supports_reasoning_summaries: true,
+        supports_reasoning_summary_parameter: reasoning,
         default_reasoning_summary: "none",
         support_verbosity: false,
         apply_patch_tool_type: "freeform",
@@ -765,9 +836,8 @@ export function codexModelCatalog(selectedModels: readonly string[]): string {
         context_window: contextWindow,
         max_context_window: contextWindow,
         effective_context_window_percent: 95,
-        supports_parallel_tool_calls: true,
         experimental_supported_tools: [],
-        input_modalities: ["text"],
+        input_modalities: inputModalities.length ? inputModalities : ["text"],
       };
     }),
   }, null, 2)}\n`;
@@ -885,6 +955,7 @@ async function applyOpenCode(
   plan: Plan,
   secret: PlanSecret,
   models: readonly string[],
+  modelParameters: ReadonlyMap<string, ModelParameterPatch>,
   installed: boolean,
 ): Promise<ApplyResult> {
   const selectedModels = normalizeModels(models, "OpenCode models");
@@ -904,7 +975,7 @@ async function applyOpenCode(
     if (secret.kind !== "codex-auth") throw new Error("Codex OAuth credential is missing");
     absorbOpenCodeOAuth(plan, secret, authText);
   }
-  const nextConfig = patchOpenCodeConfig(configText, plan, selectedModels);
+  const nextConfig = patchOpenCodeConfig(configText, plan, selectedModels, modelParameters);
   const nextAuth = patchOpenCodeAuth(authText, plan, secret);
   await writePair(authPath, nextAuth, configPath, nextConfig, {
     expectedFirst: { text: authText },
@@ -931,6 +1002,7 @@ async function applyCodex(
   plan: Plan,
   secret: PlanSecret,
   models: readonly string[],
+  modelParameters: ReadonlyMap<string, ModelParameterPatch>,
   installed: boolean,
 ): Promise<ApplyResult> {
   const selectedModels = normalizeModels(models, "Codex models");
@@ -1000,8 +1072,9 @@ async function applyCodex(
   const nextConfig = patchCodexConfig(configText, plan, selectedModels, {
     apiKey: secret.apiKey,
     modelCatalogPath: catalogPath,
+    modelParameters,
   });
-  await writePair(catalogPath, codexModelCatalog(selectedModels), configPath, nextConfig, {
+  await writePair(catalogPath, codexModelCatalog(selectedModels, modelParameters), configPath, nextConfig, {
     secondMode: 0o600,
     expectedSecond: { text: configText },
   });
@@ -1022,6 +1095,7 @@ async function applyClaude(
   plan: Plan,
   secret: PlanSecret,
   models: readonly string[],
+  modelParameters: ReadonlyMap<string, ModelParameterPatch>,
   installed: boolean,
 ): Promise<ApplyResult> {
   const selectedModels = normalizeModels(models, "Claude models");
@@ -1044,7 +1118,13 @@ async function applyClaude(
     readTextIfExists(settingsPath),
     readTextIfExists(statePath),
   ]);
-  const nextSettings = patchClaudeSettings(settingsText, plan, secret.apiKey, selectedModels);
+  const nextSettings = patchClaudeSettings(
+    settingsText,
+    plan,
+    secret.apiKey,
+    selectedModels,
+    modelParameters,
+  );
   const nextState = patchClaudeState(stateText, plan);
   await writePair(statePath, nextState, settingsPath, nextSettings, {
     secondMode: 0o600,
@@ -1074,16 +1154,61 @@ export async function applyPlanToTarget(
   target: Target,
   models: readonly string[],
   store: PlanStore = planStore,
+  modelParameters: ReadonlyMap<string, ModelParameterPatch> = new Map(),
 ): Promise<ApplyResult> {
   const selectedModels = normalizeModels(models, "Target models");
+  const supportedFields = target === "codex"
+    ? new Set(["limit.context", "modalities.input", "reasoning"])
+    : target === "claude"
+      ? new Set(["limit.context"])
+      : undefined;
+  const validatedModelParameters = new Map<string, ModelParameterPatch>();
+  for (const [model, parameterPatch] of modelParameters) {
+    if (!selectedModels.includes(model)) {
+      throw new Error("Model parameters can only target a selected model");
+    }
+    const parsed = ModelParameterOverrideSchema.safeParse({ model, ...parameterPatch });
+    if (!parsed.success) {
+      throw new Error(`Invalid model parameters for ${model}: ${parsed.error.issues[0]?.message ?? "invalid value"}`);
+    }
+    const editedFields = new Set(parsed.data.fields);
+    for (const field of parsed.data.fields) {
+      if (supportedFields && !supportedFields.has(field)) {
+        throw new Error(`${target} does not map the ${field} capability field`);
+      }
+    }
+    const parameters = parsed.data.parameters;
+    if (
+      target === "claude" &&
+      model.endsWith("[1m]") &&
+      parameters.limit.context > CLAUDE_AUTO_COMPACT_MAX
+    ) {
+      throw new Error("Claude [1m] model IDs have a fixed 1000000 token context");
+    }
+    if (target === "codex" && isKnownCapabilityModel("zhipu", model)) {
+      if (editedFields.has("reasoning") && !parameters.reasoning) {
+        throw new Error(`${model} requires reasoning in Codex`);
+      }
+      if (
+        editedFields.has("modalities.input") &&
+        (parameters.modalities.input.length !== 1 || parameters.modalities.input[0] !== "text")
+      ) {
+        throw new Error(`${model} only supports text input in Codex`);
+      }
+    }
+    validatedModelParameters.set(model, {
+      parameters,
+      fields: parsed.data.fields,
+    });
+  }
   const status = await toolsAndPaths();
   const installed = status.tools[target].installed;
   return store.withPlanForApply(planId, target, async (plan, secret) => {
     const result = target === "opencode"
-      ? await applyOpenCode(plan, secret, selectedModels, installed)
+      ? await applyOpenCode(plan, secret, selectedModels, validatedModelParameters, installed)
       : target === "codex"
-        ? await applyCodex(plan, secret, selectedModels, installed)
-        : await applyClaude(plan, secret, selectedModels, installed);
+        ? await applyCodex(plan, secret, selectedModels, validatedModelParameters, installed)
+        : await applyClaude(plan, secret, selectedModels, validatedModelParameters, installed);
     return { result, applied: result.applied };
   });
 }

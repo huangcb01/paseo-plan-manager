@@ -14,7 +14,7 @@
     "undici": "^6.28.0"
   },
   "devDependencies": {
-    "@getpaseo/client": "0.5.1",
+    "@getpaseo/client": "0.6.1",
     "@tanstack/react-query": "^5.90.11",
     "@types/node": "^20.17.0",
     "@types/react": "~19.2.0",
