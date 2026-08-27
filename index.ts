@@ -26,6 +26,7 @@ export default function contribute(plugin: PluginContext) {
     id: "coding-plans",
     title: "Coding Plans",
     icon: "Gauge",
+    locations: ["explorer"],
     context: "workspace",
     Component: CodingPlansWorkspacePanel,
   });
@@ -36,7 +37,7 @@ export default function contribute(plugin: PluginContext) {
     keywords: ["quota", "usage", "codex", "glm", "kimi"],
     context: "workspace",
     onSelect({ openPanel }) {
-      openPanel("coding-plans");
+      openPanel("coding-plans", { location: "explorer" });
     },
   });
   plugin.addCommandCenterItem({

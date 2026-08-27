@@ -16,13 +16,13 @@
 - 将所选模型写入 OpenCode 自定义 provider、智谱 Codex 模型目录或 Claude Code model picker，同时保留无关配置和 JSONC 注释。
 - 检测 `opencode`、`codex`、`claude` 是否存在；插件不包含、下载或安装任何 CLI。
 
-## Workspace 标签页
+## 右侧边栏
 
-插件通过 Paseo Workspace Panel API 展示完整管理界面。打开后，**Coding Plans** 会作为标签出现在当前 Workspace 主区域，与 Agent 标签并列；它不再占用全局侧栏。
+插件通过 Paseo Workspace Panel API 展示完整管理界面。打开后，**Coding Plans** 会作为标签出现在当前 Workspace 的右侧边栏，不占用主区域的 Agent 标签页。
 
 ## 安装
 
-要求 Paseo 0.5.x、Node.js 20 或更高版本。
+要求 Paseo 0.6.1、Node.js 20 或更高版本。
 
 ```bash
 npm install
@@ -37,7 +37,7 @@ npm run check
 paseo plugin reload coding-plan-manager
 ```
 
-安装后进入任意 Workspace，通过 `Ctrl+K` / `Cmd+K` 搜索 **Open Coding Plans** 或 **Open and refresh Coding Plan usage** 打开标签页。
+安装后进入任意 Workspace，通过 `Ctrl+K` / `Cmd+K` 搜索 **Open Coding Plans** 在右侧边栏打开页面；搜索 **Refresh Coding Plan usage** 可直接刷新用量。
 
 ## 添加 Plan
 
