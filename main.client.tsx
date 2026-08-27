@@ -336,9 +336,9 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       gap: 18,
     },
     header: {
-      flexDirection: compact ? "column" : "row",
-      flexWrap: "nowrap",
-      alignItems: compact ? "stretch" : "flex-start",
+      flexDirection: "row",
+      flexWrap: "wrap",
+      alignItems: "flex-start",
       justifyContent: "space-between",
       gap: 14,
       paddingBottom: 18,
@@ -348,6 +348,7 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
     headerCopy: {
       flexGrow: 1,
       flexShrink: 1,
+      flexBasis: 200,
       minWidth: 0,
     },
     eyebrow: {
@@ -375,7 +376,7 @@ function createStyles(theme: PluginWorkspacePanelProps["theme"], compact: boolea
       alignItems: "center",
       flexWrap: "wrap",
       flexShrink: 0,
-      justifyContent: compact ? "flex-start" : "flex-end",
+      justifyContent: "flex-end",
       alignSelf: "flex-start",
       maxWidth: "100%",
       gap: 8,
