@@ -60,12 +60,13 @@ test("patches one multi-model OpenCode provider while preserving comments and un
   assert.match(output, /keep this comment/);
   assert.equal(parsed.theme, "system");
   assert.ok(parsed.provider.local);
-  assert.equal(parsed.provider.kimi.npm, "@ai-sdk/anthropic");
-  assert.equal(parsed.provider.kimi.options.baseURL, "https://api.kimi.com/coding/v1");
-  assert.equal(parsed.provider.kimi.options.apiKey, undefined);
-  assert.deepEqual(parsed.provider.kimi.models, {
+  assert.deepEqual(parsed.provider.kimi, { old: true });
+  assert.equal(parsed.provider["kimi-for-coding"].npm, "@ai-sdk/anthropic");
+  assert.equal(parsed.provider["kimi-for-coding"].name, undefined);
+  assert.equal(parsed.provider["kimi-for-coding"].options.baseURL, "https://api.kimi.com/coding/v1");
+  assert.equal(parsed.provider["kimi-for-coding"].options.apiKey, undefined);
+  assert.deepEqual(parsed.provider["kimi-for-coding"].models, {
     "kimi-for-coding": {
-      name: "kimi-for-coding",
       limit: { context: 262_144, output: 32_768 },
       modalities: { input: ["text", "image", "video"], output: ["text"] },
       reasoning: true,
@@ -74,7 +75,6 @@ test("patches one multi-model OpenCode provider while preserving comments and un
       temperature: false,
     },
     "kimi-latest": {
-      name: "kimi-latest",
       limit: { context: 262_144, output: 32_768 },
       modalities: { input: ["text"], output: ["text"] },
       reasoning: true,
@@ -83,13 +83,42 @@ test("patches one multi-model OpenCode provider while preserving comments and un
       temperature: false,
     },
   });
-  assert.equal(parsed.model, "kimi/kimi-for-coding");
+  assert.equal(parsed.model, "kimi-for-coding/kimi-for-coding");
+});
+
+test("removes the legacy custom OpenCode provider only when it is plugin-managed", () => {
+  const legacy = {
+    npm: "@ai-sdk/anthropic",
+    name: "Kimi For Coding",
+    options: { baseURL: "https://api.kimi.com/coding/v1", setCacheKey: true },
+    models: { k3: { name: "k3" } },
+  };
+  const customized = JSON.parse(JSON.stringify(legacy));
+  customized.options.baseURL = "https://kimi-proxy.example/v1";
+
+  const migrated = parse(patchOpenCodeConfig(
+    JSON.stringify({ provider: { kimi: legacy, local: { models: {} } } }),
+    plan("kimi"),
+    ["k3"],
+  )) as Record<string, any>;
+  assert.equal(migrated.provider.kimi, undefined);
+  assert.equal(migrated.provider["kimi-for-coding"].npm, "@ai-sdk/anthropic");
+  assert.deepEqual(migrated.provider.local.models, {});
+  assert.equal(migrated.model, "kimi-for-coding/k3");
+
+  const kept = parse(patchOpenCodeConfig(
+    JSON.stringify({ provider: { kimi: customized } }),
+    plan("kimi"),
+    ["k3"],
+  )) as Record<string, any>;
+  assert.equal(kept.provider.kimi.options.baseURL, "https://kimi-proxy.example/v1");
+  assert.equal(kept.provider["kimi-for-coding"].npm, "@ai-sdk/anthropic");
 });
 
 test("patches only managed fields inside an existing OpenCode provider", () => {
   const source = `{
   "provider": {
-    "kimi": {
+    "kimi-for-coding": {
       // preserve this provider comment
       "api": "https://user.example/v1",
       "env": ["USER_KIMI_KEY"],
@@ -113,30 +142,30 @@ test("patches only managed fields inside an existing OpenCode provider", () => {
   const parsed = parse(output) as Record<string, any>;
 
   assert.match(output, /preserve this provider comment/);
-  assert.equal(parsed.provider.kimi.api, "https://user.example/v1");
-  assert.deepEqual(parsed.provider.kimi.env, ["USER_KIMI_KEY"]);
-  assert.equal(parsed.provider.kimi.options.timeout, 1234);
-  assert.equal(parsed.provider.kimi.options.apiKey, undefined);
-  assert.deepEqual(parsed.provider.kimi.models["user-model"], {
+  assert.equal(parsed.provider["kimi-for-coding"].api, "https://user.example/v1");
+  assert.deepEqual(parsed.provider["kimi-for-coding"].env, ["USER_KIMI_KEY"]);
+  assert.equal(parsed.provider["kimi-for-coding"].options.timeout, 1234);
+  assert.equal(parsed.provider["kimi-for-coding"].options.apiKey, undefined);
+  assert.deepEqual(parsed.provider["kimi-for-coding"].models["user-model"], {
     name: "User model",
     headers: { "X-User": "keep" },
   });
-  assert.deepEqual(parsed.provider.kimi.models["kimi-for-coding"].headers, { "X-Selected": "keep" });
-  assert.deepEqual(parsed.provider.kimi.models["kimi-for-coding"].variants, {
+  assert.deepEqual(parsed.provider["kimi-for-coding"].models["kimi-for-coding"].headers, { "X-Selected": "keep" });
+  assert.deepEqual(parsed.provider["kimi-for-coding"].models["kimi-for-coding"].variants, {
     fast: { disabled: false },
   });
-  assert.deepEqual(parsed.provider.kimi.models["kimi-for-coding"].limit, {
+  assert.deepEqual(parsed.provider["kimi-for-coding"].models["kimi-for-coding"].limit, {
     context: 262_144,
     input: 999,
     output: 32_768,
   });
-  assert.equal(parsed.provider.kimi.models["kimi-for-coding"].name, "kimi-for-coding");
+  assert.equal(parsed.provider["kimi-for-coding"].models["kimi-for-coding"].name, "User label");
 });
 
 test("preserves capabilities already defined for a selected custom OpenCode model", () => {
   const source = JSON.stringify({
     provider: {
-      kimi: {
+      "kimi-for-coding": {
         models: {
           "private-model": {
             name: "Private model",
@@ -153,7 +182,7 @@ test("preserves capabilities already defined for a selected custom OpenCode mode
   });
   const parsed = JSON.parse(patchOpenCodeConfig(source, plan("kimi"), ["private-model"]));
 
-  assert.deepEqual(parsed.provider.kimi.models["private-model"], {
+  assert.deepEqual(parsed.provider["kimi-for-coding"].models["private-model"], {
     name: "Private model",
     limit: { context: 777_777, output: 12_345 },
     modalities: { input: ["text", "pdf"], output: ["text"] },
@@ -166,34 +195,48 @@ test("preserves capabilities already defined for a selected custom OpenCode mode
 
 test("writes model-specific OpenCode limits and modalities", () => {
   const kimi = JSON.parse(patchOpenCodeConfig(undefined, plan("kimi"), ["k3", "k3-256k"]));
-  assert.deepEqual(kimi.provider.kimi.models.k3.limit, { context: 1_048_576, output: 131_072 });
-  assert.deepEqual(kimi.provider.kimi.models.k3.modalities.input, ["text", "image", "video"]);
-  assert.equal(kimi.provider.kimi.models.k3.attachment, false);
-  assert.equal(kimi.provider.kimi.models.k3.tool_call, true);
-  assert.equal(kimi.provider.kimi.models.k3.temperature, false);
+  assert.deepEqual(kimi.provider["kimi-for-coding"].models.k3.limit, { context: 1_048_576, output: 131_072 });
+  assert.deepEqual(kimi.provider["kimi-for-coding"].models.k3.modalities.input, ["text", "image", "video"]);
+  assert.equal(kimi.provider["kimi-for-coding"].models.k3.attachment, false);
+  assert.equal(kimi.provider["kimi-for-coding"].models.k3.tool_call, true);
+  assert.equal(kimi.provider["kimi-for-coding"].models.k3.temperature, false);
 
   const zhipu = JSON.parse(patchOpenCodeConfig(undefined, plan("zhipu"), ["glm-5.3"]));
-  assert.deepEqual(zhipu.provider.zhipu.models["glm-5.3"].limit, {
+  assert.deepEqual(zhipu.provider["zhipuai-coding-plan"].models["glm-5.3"].limit, {
     context: 1_000_000,
     output: 131_072,
   });
-  assert.deepEqual(zhipu.provider.zhipu.models["glm-5.3"].modalities, {
+  assert.deepEqual(zhipu.provider["zhipuai-coding-plan"].models["glm-5.3"].modalities, {
     input: ["text"],
     output: ["text"],
   });
-  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].reasoning, true);
-  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].attachment, false);
-  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].tool_call, true);
-  assert.equal(zhipu.provider.zhipu.models["glm-5.3"].temperature, true);
-  assert.deepEqual(zhipu.provider.zhipu.models["glm-5.3"].interleaved, {
+  assert.equal(zhipu.provider["zhipuai-coding-plan"].models["glm-5.3"].reasoning, true);
+  assert.equal(zhipu.provider["zhipuai-coding-plan"].models["glm-5.3"].attachment, false);
+  assert.equal(zhipu.provider["zhipuai-coding-plan"].models["glm-5.3"].tool_call, true);
+  assert.equal(zhipu.provider["zhipuai-coding-plan"].models["glm-5.3"].temperature, true);
+  assert.deepEqual(zhipu.provider["zhipuai-coding-plan"].models["glm-5.3"].interleaved, {
     field: "reasoning_content",
   });
+  assert.equal(zhipu.model, "zhipuai-coding-plan/glm-5.3");
+});
+
+test("maps zhipu regions onto their native OpenCode coding plan providers", () => {
+  const cn = JSON.parse(patchOpenCodeConfig(undefined, plan("zhipu"), ["glm-5.3"]));
+  assert.equal(cn.provider["zhipuai-coding-plan"].options.baseURL, "https://open.bigmodel.cn/api/coding/paas/v4");
+  assert.equal(cn.provider["zhipuai-coding-plan"].npm, "@ai-sdk/openai-compatible");
+
+  const global = JSON.parse(patchOpenCodeConfig(undefined, { ...plan("zhipu"), region: "global" }, ["glm-5.3"]));
+  assert.equal(global.provider["zai-coding-plan"].options.baseURL, "https://api.z.ai/api/coding/paas/v4");
+  assert.equal(global.model, "zai-coding-plan/glm-5.3");
+
+  const dev = JSON.parse(patchOpenCodeConfig(undefined, { ...plan("zhipu"), region: "cn-dev" }, ["glm-5.3"]));
+  assert.equal(dev.provider["zhipuai-coding-plan"].options.baseURL, "https://dev.bigmodel.cn/api/coding/paas/v4");
 });
 
 test("applies explicit per-model OpenCode capabilities and clears optional fields", () => {
   const source = JSON.stringify({
     provider: {
-      kimi: {
+      "kimi-for-coding": {
         models: {
           "kimi-for-coding": {
             limit: { context: 1, input: 1, output: 1 },
@@ -229,7 +272,7 @@ test("applies explicit per-model OpenCode capabilities and clears optional field
       "interleaved",
     ])]]),
   ));
-  const model = parsed.provider.kimi.models["kimi-for-coding"];
+  const model = parsed.provider["kimi-for-coding"].models["kimi-for-coding"];
   assert.deepEqual(model.limit, { context: 300_000, output: 50_000 });
   assert.deepEqual(model.modalities, { input: ["text", "pdf"], output: ["text", "image"] });
   assert.equal(model.reasoning, false);
@@ -242,7 +285,7 @@ test("applies explicit per-model OpenCode capabilities and clears optional field
 test("changes only explicitly edited fields on an existing unknown OpenCode model", () => {
   const source = JSON.stringify({
     provider: {
-      kimi: {
+      "kimi-for-coding": {
         models: {
           "private-kimi": {
             name: "Private display name",
@@ -272,7 +315,7 @@ test("changes only explicitly edited fields on an existing unknown OpenCode mode
       "interleaved",
     ])]]),
   ));
-  assert.deepEqual(parsed.provider.kimi.models["private-kimi"], {
+  assert.deepEqual(parsed.provider["kimi-for-coding"].models["private-kimi"], {
     name: "Private display name",
     limit: { context: 262_144, output: 11_000, vendor: "keep" },
     modalities: { input: ["text", "pdf"], output: ["text", "audio"] },
@@ -287,7 +330,7 @@ test("changes only explicitly edited fields on an existing unknown OpenCode mode
 test("rejects an unknown OpenCode limit patch that conflicts with preserved fields", () => {
   const source = JSON.stringify({
     provider: {
-      kimi: {
+      "kimi-for-coding": {
         models: {
           "private-kimi": { limit: { context: 100_000, output: 50_000 } },
         },
@@ -310,7 +353,7 @@ test("rejects an unknown OpenCode limit patch that conflicts with preserved fiel
 
 test("validates sparse OpenCode limits against preserved or completed fields", () => {
   const withLargeContext = JSON.stringify({
-    provider: { kimi: { models: { "private-kimi": { limit: { context: 1_000_000, output: 50_000 } } } } },
+    provider: { "kimi-for-coding": { models: { "private-kimi": { limit: { context: 1_000_000, output: 50_000 } } } } },
   });
   const outputParameters = modelCapabilityParameters("kimi", "private-kimi");
   outputParameters.limit.output = 500_000;
@@ -320,13 +363,13 @@ test("validates sparse OpenCode limits against preserved or completed fields", (
     ["private-kimi"],
     new Map([["private-kimi", modelPatch(outputParameters, ["limit.output"])]]),
   ));
-  assert.deepEqual(updated.provider.kimi.models["private-kimi"].limit, {
+  assert.deepEqual(updated.provider["kimi-for-coding"].models["private-kimi"].limit, {
     context: 1_000_000,
     output: 500_000,
   });
 
   const withoutLimit = JSON.stringify({
-    provider: { kimi: { models: { "private-kimi": { vendor: "keep" } } } },
+    provider: { "kimi-for-coding": { models: { "private-kimi": { vendor: "keep" } } } },
   });
   const contextParameters = modelCapabilityParameters("kimi", "private-kimi");
   contextParameters.limit.context = 300_000;
@@ -336,7 +379,7 @@ test("validates sparse OpenCode limits against preserved or completed fields", (
     ["private-kimi"],
     new Map([["private-kimi", modelPatch(contextParameters, ["limit.context"])]]),
   ));
-  assert.deepEqual(completed.provider.kimi.models["private-kimi"], {
+  assert.deepEqual(completed.provider["kimi-for-coding"].models["private-kimi"], {
     vendor: "keep",
     limit: { context: 300_000, output: 32_768 },
   });
@@ -464,7 +507,22 @@ test("patches OpenCode auth without deleting another provider", () => {
   );
   const parsed = JSON.parse(output);
   assert.equal(parsed.local.key, "keep");
-  assert.deepEqual(parsed.zhipu, { type: "api", key: "secret" });
+  assert.deepEqual(parsed["zhipuai-coding-plan"], { type: "api", key: "secret" });
+  assert.equal(parsed.zhipu, undefined);
+});
+
+test("removes legacy OpenCode auth entries listed by the caller", () => {
+  const output = patchOpenCodeAuth(
+    '{"zhipu":{"type":"api","key":"old"},"kimi":{"type":"api","key":"old"},"local":{"type":"api","key":"keep"}}',
+    plan("zhipu"),
+    { kind: "api-key", apiKey: "secret" },
+    ["zhipu"],
+  );
+  const parsed = JSON.parse(output);
+  assert.equal(parsed.zhipu, undefined);
+  assert.deepEqual(parsed.kimi, { type: "api", key: "old" });
+  assert.equal(parsed.local.key, "keep");
+  assert.deepEqual(parsed["zhipuai-coding-plan"], { type: "api", key: "secret" });
 });
 
 test("converts Codex OAuth auth to the OpenCode OAuth shape", () => {
@@ -1169,6 +1227,66 @@ test("preserves a newer same-identity OpenCode OAuth generation", async () => {
     if (stored.kind === "codex-auth") {
       assert.equal((stored.auth.tokens as Record<string, unknown>).refresh_token, "newer-refresh");
     }
+  } finally {
+    if (previousXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdgConfig;
+    if (previousXdgData === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = previousXdgData;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("migrates a legacy custom OpenCode provider to the native coding plan provider", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-native-"));
+  const previousXdgConfig = process.env.XDG_CONFIG_HOME;
+  const previousXdgData = process.env.XDG_DATA_HOME;
+  process.env.XDG_CONFIG_HOME = path.join(root, "config");
+  process.env.XDG_DATA_HOME = path.join(root, "data");
+  try {
+    const configDir = path.join(root, "config", "opencode");
+    await mkdir(configDir, { recursive: true });
+    await writeFile(path.join(configDir, "opencode.jsonc"), JSON.stringify({
+      provider: {
+        zhipu: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Zhipu GLM",
+          options: { baseURL: "https://open.bigmodel.cn/api/coding/paas/v4", setCacheKey: true },
+          models: { "glm-5.3": { name: "glm-5.3" } },
+        },
+      },
+    }));
+    const opencodeAuth = path.join(root, "data", "opencode", "auth.json");
+    await mkdir(path.dirname(opencodeAuth), { recursive: true });
+    await writeFile(opencodeAuth, JSON.stringify({
+      "zhipuai-coding-plan": { type: "api", key: "native-key" },
+      zhipu: { type: "api", key: "legacy-key" },
+    }));
+
+    const store = new PlanStore(path.join(root, "store"));
+    const saved = await store.savePlan({
+      label: "GLM",
+      provider: "zhipu",
+      region: "cn",
+      apiKey: "plan-key",
+    });
+    const result = await applyPlanToTarget(saved.id, "opencode", ["glm-5.3"], store);
+    assert.equal(result.applied, true);
+    assert.ok(result.warnings.some((warning) => warning.includes("zhipuai-coding-plan") && warning.includes("zhipu")));
+
+    const config = JSON.parse(
+      await readFile(path.join(configDir, "opencode.jsonc"), "utf8"),
+    );
+    assert.equal(config.provider.zhipu, undefined);
+    assert.equal(config.provider["zhipuai-coding-plan"].npm, "@ai-sdk/openai-compatible");
+    assert.deepEqual(config.provider["zhipuai-coding-plan"].models["glm-5.3"].limit, {
+      context: 1_000_000,
+      output: 131_072,
+    });
+    assert.equal(config.model, "zhipuai-coding-plan/glm-5.3");
+
+    const live = JSON.parse(await readFile(opencodeAuth, "utf8"));
+    assert.equal(live.zhipu, undefined);
+    assert.deepEqual(live["zhipuai-coding-plan"], { type: "api", key: "plan-key" });
   } finally {
     if (previousXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = previousXdgConfig;

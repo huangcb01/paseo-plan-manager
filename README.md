@@ -13,7 +13,7 @@
 - Codex 和智谱额外展示服务端 7/30 天 Token 活动；Kimi 每 5 分钟至多保存一个本地配额快照并保留 7 天。
 - 应用 Plan 时再为目标工具选择 1–16 个模型，首个作为当前默认；模型列表仅用于本次写入，不保存到 Plan。
 - 每个 API Key 模型可在写入前调整本次接入使用的能力 metadata；编辑范围会按目标工具实际支持的目录字段收窄。
-- 将所选模型写入 OpenCode 自定义 provider、智谱 Codex 模型目录或 Claude Code model picker，同时保留无关配置和 JSONC 注释。
+- 将所选模型写入 OpenCode 内置 coding plan provider（与 `opencode auth login` 合并）、智谱 Codex 模型目录或 Claude Code model picker，同时保留无关配置和 JSONC 注释。
 - 检测 `opencode`、`codex`、`claude` 是否存在；插件不包含、下载或安装任何 CLI。
 
 ## 右侧边栏
@@ -105,7 +105,9 @@ Codex 当前额度仍来自 `/backend-api/wham/usage`；按日 Token 活动来�
 - 凭据：`$XDG_DATA_HOME/opencode/auth.json`，否则 `~/.local/share/opencode/auth.json`。
 - 已存在 `opencode.jsonc` 时优先修改它，否则使用 `opencode.json`。
 
-智谱和 Kimi 会把本次所选模型及其 context/output、输入输出模态、推理、附件、工具调用和 temperature 能力写入 `provider.zhipu.models` 或 `provider.kimi.models`；GLM 还会写入 `reasoning_content` interleaved 协议字段。首个模型用于更新顶层 `model`；未知自定义模型已有的能力声明不会被覆盖，打开参数编辑器时也只写入相对估算默认值实际改动的字段。参数面板会按 OpenCode 1.18.18 的默认规则预估自动压缩阈值：未设置 input 时从 context 最多预留 32,000 output token；设置 input 后从 input 最多预留 20,000。插件只更新该 provider 中由自身管理的连接和模型字段，保留用户的 timeout、headers、其他模型及 JSONC 注释。Codex OAuth 只更新顶层默认模型，不改 OpenCode 内置 OpenAI 模型目录。插件还会更新对应 auth 条目，其他 provider、插件、MCP 和 skills 会保留。若设置了 `OPENCODE_CONFIG_CONTENT` 或 `OPENCODE_AUTH_CONTENT`，文件修改不会生效，因此插件会拒绝操作。
+智谱和 Kimi 直接复用 OpenCode 内置（models.dev）的 coding plan provider：中国区和 Dev 写入 `provider["zhipuai-coding-plan"]`，Z.AI Global 写入 `provider["zai-coding-plan"]`，Kimi 写入 `provider["kimi-for-coding"]`，并更新对应 auth 条目。这样与 `opencode auth login` 的结果合并到同一个 provider，模型列表不再出现重复条目。插件会把本次所选模型及其 context/output、输入输出模态、推理、附件、工具调用和 temperature 能力写入该 provider 的 models，用户 config 中的字段按 OpenCode 规则覆盖内置目录；不再写入 provider 和模型的 `name`，保留 models.dev 的显示名（如 "GLM-5.3"）。GLM 还会写入 `reasoning_content` interleaved 协议字段。首个模型用于更新顶层 `model`（如 `zhipuai-coding-plan/glm-5.3`）；未知自定义模型已有的能力声明不会被覆盖，打开参数编辑器时也只写入相对估算默认值实际改动的字段。参数面板会按 OpenCode 1.18.18 的默认规则预估自动压缩阈值：未设置 input 时从 context 最多预留 32,000 output token；设置 input 后从 input 最多预留 20,000。插件只更新该 provider 中由自身管理的连接和模型字段，保留用户的 timeout、headers、其他模型及 JSONC 注释。Codex OAuth 只更新顶层默认模型，不改 OpenCode 内置 OpenAI 模型目录。若设置了 `OPENCODE_CONFIG_CONTENT` 或 `OPENCODE_AUTH_CONTENT`，文件修改不会生效，因此插件会拒绝操作。
+
+旧版本插件写入的自定义 provider（`provider.zhipu`、`provider.kimi`）会在下一次应用对应 provider 的 Plan 时自动迁移：仅当旧块仍是插件托管形态（npm 与 coding plan baseURL 均未改动）时，才会删除旧 provider 块和对应 auth 条目并给出提示；用户自行修改过的块会被保留。切换智谱区域（如中国区 ↔ Global）会写入不同的内置 provider ID，两者可以像两次原生登录一样共存。
 
 OpenCode 的 Active 状态按 provider 分槽保存：Codex、智谱和 Kimi 各自最多保留一个 Plan，因此三个 provider 的凭据和目录状态可以同时共存；再次应用同一 provider 的 Plan 只替换该 provider 的记录。不过 OpenCode 顶层 `model` 始终只有一个，最近一次成功应用的 Plan 首个模型是当前默认。Codex 和 Claude Code 的 Active 状态仍各自是单例，后一次成功应用会替换该目标先前的 Plan。
 
