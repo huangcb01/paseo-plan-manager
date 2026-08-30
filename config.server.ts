@@ -69,7 +69,7 @@ export interface ApplyResult {
 }
 
 interface ProviderProjection {
-  providerId: "zhipu" | "kimi";
+  providerId: "zhipuai-coding-plan" | "zai-coding-plan" | "kimi-for-coding";
   displayName: string;
   opencode: { npm: string; baseUrl: string };
   codex: { baseUrl: string };
@@ -79,6 +79,26 @@ interface ProviderProjection {
   };
 }
 
+const OPENCODE_LEGACY_PROVIDER_ID: Record<"zhipu" | "kimi", string> = {
+  zhipu: "zhipu",
+  kimi: "kimi",
+};
+
+const OPENCODE_MANAGED_CONNECTIONS: Record<"zhipu" | "kimi", { npm: string; baseUrls: readonly string[] }> = {
+  zhipu: {
+    npm: "@ai-sdk/openai-compatible",
+    baseUrls: [
+      "https://open.bigmodel.cn/api/coding/paas/v4",
+      "https://api.z.ai/api/coding/paas/v4",
+      "https://dev.bigmodel.cn/api/coding/paas/v4",
+    ],
+  },
+  kimi: {
+    npm: "@ai-sdk/anthropic",
+    baseUrls: ["https://api.kimi.com/coding/v1"],
+  },
+};
+
 type ApiKeyProvider = CapabilityProvider;
 
 function openCodeModelDefinition(
@@ -87,7 +107,6 @@ function openCodeModelDefinition(
   capabilities: ModelCapabilityParameters = modelCapabilityParameters(provider, model),
 ): Record<string, unknown> {
   return {
-    name: model,
     limit: {
       context: capabilities.limit.context,
       ...(capabilities.limit.input !== undefined ? { input: capabilities.limit.input } : {}),
@@ -175,7 +194,7 @@ function normalizeModels(values: readonly string[], description: string): string
 export function providerProjection(plan: Plan): ProviderProjection {
   if (plan.provider === "kimi") {
     return {
-      providerId: "kimi",
+      providerId: "kimi-for-coding",
       displayName: "Kimi For Coding",
       opencode: { npm: "@ai-sdk/anthropic", baseUrl: "https://api.kimi.com/coding/v1" },
       codex: { baseUrl: "https://api.kimi.com/coding/v1" },
@@ -192,7 +211,7 @@ export function providerProjection(plan: Plan): ProviderProjection {
       ? "dev.bigmodel.cn"
       : "open.bigmodel.cn";
   return {
-    providerId: "zhipu",
+    providerId: plan.region === "global" ? "zai-coding-plan" : "zhipuai-coding-plan",
     displayName: plan.region === "global" ? "Zhipu GLM Global" : "Zhipu GLM",
     opencode: {
       npm: "@ai-sdk/openai-compatible",
@@ -210,6 +229,22 @@ export function providerProjection(plan: Plan): ProviderProjection {
       apiKeyField: "ANTHROPIC_AUTH_TOKEN",
     },
   };
+}
+
+export function managedLegacyOpenCodeProviders(
+  parsed: Record<string, unknown>,
+  plan: Plan,
+): string[] {
+  if (plan.provider !== "zhipu" && plan.provider !== "kimi") return [];
+  const providerId = OPENCODE_LEGACY_PROVIDER_ID[plan.provider];
+  const providers = isObject(parsed.provider) ? parsed.provider : {};
+  const block = providers[providerId];
+  if (!isObject(block)) return [];
+  const options = isObject(block.options) ? block.options : {};
+  const connection = OPENCODE_MANAGED_CONNECTIONS[plan.provider];
+  if (block.npm !== connection.npm) return [];
+  if (!connection.baseUrls.includes(String(options.baseURL))) return [];
+  return [providerId];
 }
 
 function jsoncValue(text: string, description: string): Record<string, unknown> {
@@ -292,7 +327,6 @@ export function patchOpenCodeConfig(
 
   const changes: Array<{ path: (string | number)[]; value: unknown }> = [
     { path: ["provider", projection.providerId, "npm"], value: projection.opencode.npm },
-    { path: ["provider", projection.providerId, "name"], value: projection.displayName },
     { path: ["provider", projection.providerId, "options", "baseURL"], value: projection.opencode.baseUrl },
     { path: ["provider", projection.providerId, "options", "setCacheKey"], value: true },
     { path: ["provider", projection.providerId, "options", "apiKey"], value: undefined },
@@ -372,6 +406,9 @@ export function patchOpenCodeConfig(
         value: undefined,
       });
     }
+  }
+  for (const legacyId of managedLegacyOpenCodeProviders(parsed, plan)) {
+    changes.push({ path: ["provider", legacyId], value: undefined });
   }
   changes.push({ path: ["model"], value: `${projection.providerId}/${model}` });
   return editJsonc(source, changes);
@@ -473,6 +510,7 @@ export function patchOpenCodeAuth(
   text: string | undefined,
   plan: Plan,
   secret: PlanSecret,
+  removeLegacyProviders: readonly string[] = [],
 ): string {
   const auth = text?.trim() ? parseJsonObject(text, "OpenCode auth.json") : {};
   if (plan.provider === "codex") {
@@ -490,6 +528,7 @@ export function patchOpenCodeAuth(
   } else {
     if (secret.kind !== "api-key") throw new Error("API key is missing");
     auth[providerProjection(plan).providerId] = { type: "api", key: secret.apiKey };
+    for (const legacyId of removeLegacyProviders) delete auth[legacyId];
   }
   return `${JSON.stringify(auth, null, 2)}\n`;
 }
@@ -975,8 +1014,11 @@ async function applyOpenCode(
     if (secret.kind !== "codex-auth") throw new Error("Codex OAuth credential is missing");
     absorbOpenCodeOAuth(plan, secret, authText);
   }
+  const legacyRemovals = configText?.trim()
+    ? managedLegacyOpenCodeProviders(jsoncValue(configText, "OpenCode config"), plan)
+    : [];
   const nextConfig = patchOpenCodeConfig(configText, plan, selectedModels, modelParameters);
-  const nextAuth = patchOpenCodeAuth(authText, plan, secret);
+  const nextAuth = patchOpenCodeAuth(authText, plan, secret, legacyRemovals);
   await writePair(authPath, nextAuth, configPath, nextConfig, {
     expectedFirst: { text: authText },
     expectedSecond: { text: configText },
@@ -985,6 +1027,11 @@ async function applyOpenCode(
   warnings.push("已运行的 OpenCode 进程可能需要重新加载配置或重启。");
   if (plan.provider === "codex") {
     warnings.push("OpenCode 与 Codex 不应同时刷新同一份旋转 OAuth refresh token；切换前请结束旧会话。");
+  }
+  if (legacyRemovals.length > 0) {
+    warnings.push(
+      `检测到旧版自定义 provider ${legacyRemovals.join("、")}，已迁移到 OpenCode 内置 provider ${providerProjection(plan).providerId} 并删除旧配置与对应 auth 条目。`,
+    );
   }
   return {
     planId: plan.id,
