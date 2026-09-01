@@ -84,6 +84,7 @@ const TARGET_LABELS: Record<Target, string> = {
   opencode: "OpenCode",
   codex: "Codex",
   claude: "Claude Code",
+  ohmypi: "Oh My Pi",
 };
 
 const PROVIDER_MARKS: Record<Provider, string> = {
@@ -203,6 +204,7 @@ function errorMessage(error: unknown): string {
 
 function isTargetSupported(plan: Plan, target: Target): boolean {
   if (target === "opencode") return true;
+  if (target === "ohmypi") return true;
   if (target === "claude") return plan.provider !== "codex";
   return plan.provider === "codex" || (plan.provider === "zhipu" && plan.region !== "cn-dev");
 }
@@ -1450,12 +1452,15 @@ function ModelParameterEditor({
   const [error, setError] = useState<string>();
   const openCode = target === "opencode";
   const codex = target === "codex";
+  const ohMyPi = target === "ohmypi";
   const known = isKnownCapabilityModel(provider, model);
   const availableInputModalities: ModelModality[] = codex && known
     ? ["text"]
     : codex
       ? ["text", "image", "audio"]
-      : ["text", "audio", "image", "video", "pdf"];
+      : ohMyPi
+        ? ["text", "image"]
+        : ["text", "audio", "image", "video", "pdf"];
 
   function updateDraft(field: ModelCapabilityField, next: ModelParameterDraft) {
     setDraft(next);
@@ -1481,12 +1486,12 @@ function ModelParameterEditor({
 
     try {
       const context = parseLimit(draft.context, "Context");
-      const output = openCode
+      const output = openCode || ohMyPi
         ? parseLimit(draft.output, "Output")
         : Math.min(parameters.limit.output, context ?? parameters.limit.context);
       const input = openCode ? parseLimit(draft.input, "Input", true) : undefined;
       if (context === undefined || output === undefined) throw new Error("Token 上限不能为空");
-      if (openCode && known && output > context) throw new Error("Output 不能超过 Context");
+      if ((openCode || ohMyPi) && known && output > context) throw new Error("Output 不能超过 Context");
       if (openCode && known && input !== undefined && input > context) {
         throw new Error("Input 不能超过 Context");
       }
@@ -1500,12 +1505,12 @@ function ModelParameterEditor({
           output,
         },
         modalities: {
-          input: openCode || codex ? draft.inputModalities : [...parameters.modalities.input],
+          input: openCode || codex || ohMyPi ? draft.inputModalities : [...parameters.modalities.input],
           output: openCode ? draft.outputModalities : [...parameters.modalities.output],
         },
-        reasoning: openCode || codex ? draft.reasoning : parameters.reasoning,
+        reasoning: openCode || codex || ohMyPi ? draft.reasoning : parameters.reasoning,
         attachment: openCode ? draft.attachment : parameters.attachment,
-        toolCall: openCode ? draft.toolCall : parameters.toolCall,
+        toolCall: openCode || ohMyPi ? draft.toolCall : parameters.toolCall,
         temperature: openCode ? draft.temperature : parameters.temperature,
         interleaved: openCode ? draft.interleaved : parameters.interleaved,
       };
@@ -1533,7 +1538,9 @@ function ModelParameterEditor({
     ? "OPENCODE · 完整能力"
     : codex
       ? "CODEX · 目录映射"
-      : "CLAUDE · 全局 CONTEXT";
+      : ohMyPi
+        ? "OH MY PI · 目录映射"
+        : "CLAUDE · 全局 CONTEXT";
 
   return (
     <View style={styles.modelParameterEditor}>
@@ -1574,7 +1581,7 @@ function ModelParameterEditor({
             disabled={disabled}
           />
         ) : null}
-        {openCode ? (
+        {openCode || ohMyPi ? (
           <Field
             label="Output Token"
             value={draft.output}
@@ -1599,7 +1606,7 @@ function ModelParameterEditor({
         </View>
       ) : null}
 
-      {openCode || codex ? (
+      {openCode || codex || ohMyPi ? (
         <View style={styles.modelParameterGroup}>
           <Text style={styles.fieldLabel}>输入模态</Text>
           <View style={styles.modelParameterChoices}>
@@ -1635,7 +1642,7 @@ function ModelParameterEditor({
         </View>
       ) : null}
 
-      {openCode || codex ? (
+      {openCode || codex || ohMyPi ? (
         <View style={styles.modelParameterGroup}>
           <Text style={styles.fieldLabel}>能力开关</Text>
           <View style={styles.modelParameterChoices}>
@@ -1655,7 +1662,7 @@ function ModelParameterEditor({
                 disabled={disabled}
               />
             ) : null}
-            {openCode ? (
+            {openCode || ohMyPi ? (
               <ParameterChoice
                 label="工具调用"
                 selected={draft.toolCall}
@@ -1704,6 +1711,8 @@ function ModelParameterEditor({
         <Text style={styles.muted}>Claude Code 写入模型容量，并将自动压缩窗口限制在 100,000–1,000,000 后再由模型容量封顶；多个模型使用最小 context。</Text>
       ) : target === "codex" ? (
         <Text style={styles.muted}>Codex 映射 context、输入模态和推理目录能力；官方模型固定为 text 输入和推理模式，核心工具使用官方目录。</Text>
+      ) : target === "ohmypi" ? (
+        <Text style={styles.muted}>Oh My Pi 把调整映射为 models.yml 的 modelOverrides（contextWindow、maxTokens、input、reasoning、supportsTools）；未调整的内置模型继续使用 omp 自带目录。Dev 区域写入完整自定义模型目录。</Text>
       ) : null}
       {error ? (
         <Text accessibilityRole="alert" accessibilityLiveRegion="assertive" style={styles.error}>
@@ -2089,9 +2098,9 @@ function PlanCard({
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  const activeTargets = (["opencode", "codex", "claude"] as const).filter(
-    (target) => target === "opencode"
-      ? dashboard.activeTargets.opencode[plan.provider] === plan.id
+  const activeTargets = (["opencode", "ohmypi", "codex", "claude"] as const).filter(
+    (target) => target === "opencode" || target === "ohmypi"
+      ? dashboard.activeTargets[target][plan.provider] === plan.id
       : dashboard.activeTargets[target] === plan.id,
   );
   const [targetError, setTargetError] = useState<string | null>(null);
@@ -2142,7 +2151,7 @@ function PlanCard({
       </View>
 
       <View style={styles.row}>
-        {(["opencode", "codex", "claude"] as const).map((target) => {
+        {(["opencode", "ohmypi", "codex", "claude"] as const).map((target) => {
           const active = activeTargets.includes(target);
           const supported = isTargetSupported(plan, target);
           return (
@@ -2733,6 +2742,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
   const activeCount = dashboard
     ? new Set([
         ...Object.values(dashboard.activeTargets.opencode),
+        ...Object.values(dashboard.activeTargets.ohmypi),
         dashboard.activeTargets.codex,
         dashboard.activeTargets.claude,
       ].filter((planId): planId is string => typeof planId === "string")).size
@@ -2827,7 +2837,7 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
               <Text style={styles.statLabel}>当前已投影 Plan</Text>
             </View>
             <View style={styles.stat}>
-              <Text style={styles.statValue}>{toolsInstalled}/3</Text>
+              <Text style={styles.statValue}>{toolsInstalled}/4</Text>
               <Text style={styles.statLabel}>检测到的编码工具</Text>
             </View>
             <View style={styles.stat}>
@@ -2985,9 +2995,9 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
         {dashboard ? (
           <View style={styles.footer}>
             <Text style={styles.footerText}>插件数据：{dashboard.storagePath}</Text>
-            <Text style={styles.footerText}>
-              Codex / Claude Code 配置功能已实现但未经本机端到端测试。插件不会安装任何 CLI；未检测到工具时只会按你的按钮操作写入配置。
-            </Text>
+              <Text style={styles.footerText}>
+                Codex / Claude Code / Oh My Pi 配置功能已实现；Codex 与 Claude Code 未经本机端到端测试。插件不会安装任何 CLI；未检测到工具时只会按你的按钮操作写入配置。
+              </Text>
           </View>
         ) : null}
       </ScrollView>

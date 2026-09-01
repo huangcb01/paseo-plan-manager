@@ -25,7 +25,7 @@ import {
 } from "./file-utils.server";
 
 interface StoreState {
-  version: 4;
+  version: 5;
   plans: Plan[];
   activeTargets: ActiveTargets;
 }
@@ -66,6 +66,7 @@ const PROVIDERS = ["codex", "zhipu", "kimi"] as const satisfies readonly Provide
 function emptyActiveTargets(): ActiveTargets {
   return {
     opencode: { codex: null, zhipu: null, kimi: null },
+    ohmypi: { codex: null, zhipu: null, kimi: null },
     codex: null,
     claude: null,
   };
@@ -219,11 +220,13 @@ function migrateActiveTargets(value: unknown, plans: readonly Plan[]): ActiveTar
 
 function parseActiveTargets(value: unknown, plans: readonly Plan[]): ActiveTargets {
   const active = isObject(value) ? value : {};
-  const opencode = isObject(active.opencode) ? active.opencode : {};
   const parsed = emptyActiveTargets();
-  for (const provider of PROVIDERS) {
-    const plan = referencedPlan(plans, opencode[provider]);
-    parsed.opencode[provider] = plan?.provider === provider ? plan.id : null;
+  for (const scope of ["opencode", "ohmypi"] as const) {
+    const slots = isObject(active[scope]) ? active[scope] : {};
+    for (const provider of PROVIDERS) {
+      const plan = referencedPlan(plans, slots[provider]);
+      parsed[scope][provider] = plan?.provider === provider ? plan.id : null;
+    }
   }
   parsed.codex = referencedPlan(plans, active.codex)?.id ?? null;
   parsed.claude = referencedPlan(plans, active.claude)?.id ?? null;
@@ -233,6 +236,7 @@ function parseActiveTargets(value: unknown, plans: readonly Plan[]): ActiveTarge
 function cloneActiveTargets(active: ActiveTargets): ActiveTargets {
   return {
     opencode: { ...active.opencode },
+    ohmypi: { ...active.ohmypi },
     codex: active.codex,
     claude: active.claude,
   };
@@ -240,12 +244,14 @@ function cloneActiveTargets(active: ActiveTargets): ActiveTargets {
 
 function setActiveTarget(active: ActiveTargets, target: Target, plan: Plan): void {
   if (target === "opencode") active.opencode[plan.provider] = plan.id;
+  else if (target === "ohmypi") active.ohmypi[plan.provider] = plan.id;
   else active[target] = plan.id;
 }
 
 function clearActivePlan(active: ActiveTargets, planId: string): void {
   for (const provider of PROVIDERS) {
     if (active.opencode[provider] === planId) active.opencode[provider] = null;
+    if (active.ohmypi[provider] === planId) active.ohmypi[provider] = null;
   }
   if (active.codex === planId) active.codex = null;
   if (active.claude === planId) active.claude = null;
@@ -484,8 +490,21 @@ export class PlanStore {
           } catch {
             // Never delete credentials when the metadata file cannot be trusted.
           }
-          if (parsed?.version === 4 && Array.isArray(parsed.plans) && parsed.plans.every(validatePlan)) {
+          if (parsed?.version === 5 && Array.isArray(parsed.plans) && parsed.plans.every(validatePlan)) {
             validPlanIds = new Set(parsed.plans.map((plan) => plan.id));
+          } else if (
+            parsed?.version === 4 &&
+            Array.isArray(parsed.plans) &&
+            parsed.plans.every(validatePlan)
+          ) {
+            const plans = parsed.plans.map((plan) => structuredClone(plan));
+            const migrated: StoreState = {
+              version: 5,
+              plans,
+              activeTargets: parseActiveTargets(parsed.activeTargets, plans),
+            };
+            await atomicWriteFile(this.statePath, `${JSON.stringify(migrated, null, 2)}\n`, 0o600);
+            validPlanIds = new Set(plans.map((plan) => plan.id));
           } else if (
             parsed?.version === 3 &&
             Array.isArray(parsed.plans) &&
@@ -493,7 +512,7 @@ export class PlanStore {
           ) {
             const plans = parsed.plans.map((plan) => structuredClone(plan));
             const migrated: StoreState = {
-              version: 4,
+              version: 5,
               plans,
               activeTargets: migrateActiveTargets(parsed.activeTargets, plans),
             };
@@ -506,7 +525,7 @@ export class PlanStore {
           ) {
             const plans = parsed.plans.map(addProxyDefault);
             const migrated: StoreState = {
-              version: 4,
+              version: 5,
               plans,
               activeTargets: migrateActiveTargets(parsed.activeTargets, plans),
             };
@@ -519,12 +538,12 @@ export class PlanStore {
           ) {
             const plans = parsed.plans.map(migrateLegacyPlanV1);
             const migrated: StoreState = {
-              version: 4,
+              version: 5,
               plans,
               activeTargets: migrateActiveTargets(parsed.activeTargets, plans),
             };
             await atomicWriteFile(this.statePath, `${JSON.stringify(migrated, null, 2)}\n`, 0o600);
-            validPlanIds = new Set(migrated.plans.map((plan) => plan.id));
+            validPlanIds = new Set(plans.map((plan) => plan.id));
           }
         }
         if (validPlanIds) {
@@ -561,14 +580,14 @@ export class PlanStore {
   private async readState(): Promise<StoreState> {
     await this.initialize();
     const text = await readTextIfExists(this.statePath);
-    if (!text) return { version: 4, plans: [], activeTargets: emptyActiveTargets() };
+    if (!text) return { version: 5, plans: [], activeTargets: emptyActiveTargets() };
     const parsed = parseJsonObject(text, this.statePath);
-    if (parsed.version !== 4 || !Array.isArray(parsed.plans) || !parsed.plans.every(validatePlan)) {
+    if (parsed.version !== 5 || !Array.isArray(parsed.plans) || !parsed.plans.every(validatePlan)) {
       throw new Error(`Unsupported or corrupt plan store: ${this.statePath}`);
     }
     const plans = parsed.plans.map((plan) => structuredClone(plan));
     return {
-      version: 4,
+      version: 5,
       plans,
       activeTargets: parseActiveTargets(parsed.activeTargets, plans),
     };

@@ -4,11 +4,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { parse } from "jsonc-parser";
+import { parse as parseYaml } from "yaml";
 import {
   codexModelCatalog,
   patchClaudeSettings,
   patchClaudeState,
   patchCodexConfig,
+  patchOhMyPiConfig,
+  patchOhMyPiModels,
   patchOpenCodeAuth,
   patchOpenCodeConfig,
   applyPlanToTarget,
@@ -1357,7 +1360,7 @@ test("migrates v1 plans without retaining target models", async () => {
 
     assert.equal(plans.length, 1);
     assert.equal("models" in plans[0], false);
-    assert.equal(state.version, 4);
+    assert.equal(state.version, 5);
     assert.equal("models" in state.plans[0], false);
     assert.equal(plans[0].useProxy, false);
     assert.deepEqual((await store.getActiveTargets()).opencode, {
@@ -1393,7 +1396,7 @@ test("migrates v2 plans with provider-specific proxy defaults", async () => {
     const plans = await store.listPlans();
     const state = JSON.parse(await readFile(path.join(root, "plans.json"), "utf8"));
 
-    assert.equal(state.version, 4);
+    assert.equal(state.version, 5);
     assert.equal(plans.find((item) => item.provider === "codex")?.useProxy, true);
     assert.equal(plans.find((item) => item.provider === "zhipu")?.useProxy, false);
     assert.deepEqual((await store.getActiveTargets()).opencode, {
@@ -1401,6 +1404,39 @@ test("migrates v2 plans with provider-specific proxy defaults", async () => {
       zhipu: null,
       kimi: null,
     });
+    assert.deepEqual((await store.getActiveTargets()).ohmypi, {
+      codex: null,
+      zhipu: null,
+      kimi: null,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("migrates v4 stores to v5 by adding empty Oh My Pi slots", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-ohmypi-migration-"));
+  try {
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "plans.json"), `${JSON.stringify({
+      version: 4,
+      plans: [plan("zhipu"), plan("kimi")],
+      activeTargets: {
+        opencode: { codex: null, zhipu: "zhipu-1", kimi: null },
+        codex: null,
+        claude: "kimi-1",
+      },
+    }, null, 2)}\n`);
+
+    const store = new PlanStore(root);
+    assert.deepEqual(await store.getActiveTargets(), {
+      opencode: { codex: null, zhipu: "zhipu-1", kimi: null },
+      ohmypi: { codex: null, zhipu: null, kimi: null },
+      codex: null,
+      claude: "kimi-1",
+    });
+    const state = JSON.parse(await readFile(path.join(root, "plans.json"), "utf8"));
+    assert.equal(state.version, 5);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1424,6 +1460,255 @@ test("does not delete credentials when a v1 store cannot be migrated", async () 
     assert.equal(JSON.parse(await readFile(secretPath, "utf8")).apiKey, "preserved-secret");
     await assert.rejects(store.listPlans(), /Unsupported or corrupt plan store/);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("patches Oh My Pi models.yml for built-in providers while preserving comments and unrelated providers", () => {
+  const source = `# user comment at top
+providers:
+  ollama:
+    baseUrl: http://127.0.0.1:11434
+    auth: none
+  zhipu-coding-plan:
+    # provider note
+    modelOverrides:
+      glm-5.1:
+        name: Renamed by user
+`;
+  const parameters = structuredClone(modelCapabilityParameters("zhipu", "glm-5.3"));
+  parameters.limit.context = 999_000;
+  parameters.reasoning = false;
+  const output = patchOhMyPiModels(source, plan("zhipu"), ["glm-5.3", "glm-5.1"], "cn-secret", new Map([
+    ["glm-5.3", modelPatch(parameters, ["limit.context", "reasoning"])],
+  ]));
+  const parsed = parseYaml(output) as Record<string, any>;
+
+  assert.match(output, /# user comment at top/);
+  assert.match(output, /# provider note/);
+  assert.equal(parsed.providers.ollama.baseUrl, "http://127.0.0.1:11434");
+  assert.equal(parsed.providers["zhipu-coding-plan"].apiKey, "cn-secret");
+  assert.equal(parsed.providers["zhipu-coding-plan"].models, undefined);
+  assert.deepEqual(parsed.providers["zhipu-coding-plan"].modelOverrides["glm-5.3"], {
+    contextWindow: 999_000,
+    reasoning: false,
+  });
+  assert.deepEqual(parsed.providers["zhipu-coding-plan"].modelOverrides["glm-5.1"], {
+    name: "Renamed by user",
+  });
+});
+
+test("creates Oh My Pi overrides for zai global and kimi-code providers", () => {
+  const globalPlan = { ...plan("zhipu"), region: "global" as const };
+  const zai = parseYaml(patchOhMyPiModels(undefined, globalPlan, ["glm-5.3"], "zai-secret")) as Record<string, any>;
+  assert.equal(zai.providers.zai.apiKey, "zai-secret");
+  assert.equal(zai.providers.zai.baseUrl, undefined);
+
+  const kimi = parseYaml(patchOhMyPiModels(
+    "providers:\n  zai:\n    apiKey: older-key\n",
+    plan("kimi"),
+    ["kimi-for-coding"],
+    "kimi-secret",
+  )) as Record<string, any>;
+  assert.equal(kimi.providers["kimi-code"].apiKey, "kimi-secret");
+  assert.equal(kimi.providers.zai.apiKey, "older-key");
+});
+
+test("writes a full custom Oh My Pi provider for the Zhipu Dev region", () => {
+  const devPlan = { ...plan("zhipu"), region: "cn-dev" as const };
+  const parameters = structuredClone(modelCapabilityParameters("zhipu", "glm-5.3"));
+  parameters.limit.output = 65_536;
+  const output = patchOhMyPiModels(undefined, devPlan, ["glm-5.3"], "dev-secret", new Map([
+    ["glm-5.3", modelPatch(parameters, ["limit.output"])],
+  ]));
+  const parsed = parseYaml(output) as Record<string, any>;
+  assert.equal(parsed.providers["zhipu-coding-plan-dev"].baseUrl, "https://dev.bigmodel.cn/api/coding/paas/v4");
+  assert.equal(parsed.providers["zhipu-coding-plan-dev"].api, "openai-completions");
+  assert.equal(parsed.providers["zhipu-coding-plan-dev"].apiKey, "dev-secret");
+  assert.deepEqual(parsed.providers["zhipu-coding-plan-dev"].models, [
+    {
+      id: "glm-5.3",
+      name: "glm-5.3",
+      contextWindow: 1_000_000,
+      maxTokens: 65_536,
+      reasoning: true,
+      input: ["text"],
+    },
+  ]);
+});
+
+test("sets modelRoles.default in Oh My Pi config.yml without touching other settings", () => {
+  const source = `# my settings
+appearance:
+  theme.dark: titanium
+modelRoles:
+  smol: zhipu-coding-plan/glm-5-turbo
+  default: kimi-code/k3
+disabledProviders:
+  - openrouter
+`;
+  const output = patchOhMyPiConfig(source, "zhipu-coding-plan", "glm-5.3");
+  const parsed = parseYaml(output) as Record<string, any>;
+
+  assert.match(output, /# my settings/);
+  assert.equal(parsed.appearance["theme.dark"], "titanium");
+  assert.equal(parsed.modelRoles.default, "zhipu-coding-plan/glm-5.3");
+  assert.equal(parsed.modelRoles.smol, "zhipu-coding-plan/glm-5-turbo");
+  assert.deepEqual(parsed.disabledProviders, ["openrouter"]);
+});
+
+test("rejects malformed Oh My Pi YAML files", () => {
+  assert.throws(
+    () => patchOhMyPiModels("providers: [a, b]", plan("kimi"), ["k3"], "key"),
+    /mapping/,
+  );
+  assert.throws(
+    () => patchOhMyPiConfig("modelRoles: nope\n  broken: [", "kimi-code", "k3"),
+    /not valid YAML/,
+  );
+});
+
+test("writes Oh My Pi files under PI_CODING_AGENT_DIR and tracks per-provider active state", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-ohmypi-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = path.join(root, "agent");
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    await mkdir(path.join(agentDir), { recursive: true });
+    const modelsPath = path.join(agentDir, "models.yml");
+    const configPath = path.join(agentDir, "config.yml");
+    await writeFile(modelsPath, "# existing\nproviders:\n  local: { auth: none }\n");
+    const store = new PlanStore(path.join(root, "store"));
+    const zhipu = await store.savePlan({
+      label: "GLM",
+      provider: "zhipu",
+      region: "cn",
+      apiKey: "zhipu-secret",
+    });
+
+    const parameters = structuredClone(modelCapabilityParameters("zhipu", "glm-5.1"));
+    parameters.limit.context = 123_456;
+    const result = await applyPlanToTarget(zhipu.id, "ohmypi", ["glm-5.1", "glm-5.3"], store, new Map([
+      ["glm-5.1", modelPatch(parameters, ["limit.context"])],
+    ]));
+
+    assert.equal(result.applied, true);
+    assert.deepEqual(result.configPaths, [modelsPath, configPath]);
+    const models = parseYaml(await readFile(modelsPath, "utf8")) as Record<string, any>;
+    assert.equal(models.providers.local.auth, "none");
+    assert.equal(models.providers["zhipu-coding-plan"].apiKey, "zhipu-secret");
+    assert.equal(models.providers["zhipu-coding-plan"].modelOverrides["glm-5.1"].contextWindow, 123_456);
+    const config = parseYaml(await readFile(configPath, "utf8")) as Record<string, any>;
+    assert.equal(config.modelRoles.default, "zhipu-coding-plan/glm-5.1");
+    assert.deepEqual((await store.getActiveTargets()).ohmypi, {
+      codex: null,
+      zhipu: zhipu.id,
+      kimi: null,
+    });
+
+    const kimi = await store.savePlan({ label: "Kimi", provider: "kimi", apiKey: "kimi-secret" });
+    await applyPlanToTarget(kimi.id, "ohmypi", ["k3"], store);
+    const active = await store.getActiveTargets();
+    assert.equal(active.ohmypi.zhipu, zhipu.id);
+    assert.equal(active.ohmypi.kimi, kimi.id);
+    const configAfter = parseYaml(await readFile(configPath, "utf8")) as Record<string, any>;
+    assert.equal(configAfter.modelRoles.default, "kimi-code/k3");
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("imports Codex OAuth into Oh My Pi through omp auth-broker import", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-ohmypi-codex-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousPath = process.env.PATH;
+  const agentDir = path.join(root, "agent");
+  const binDir = path.join(root, "bin");
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const importLog = path.join(root, "import-log.jsonl");
+  try {
+    await mkdir(agentDir, { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    const fakeOmp = path.join(binDir, "omp");
+    await writeFile(fakeOmp, [
+      "#!/bin/sh",
+      'if [ "$1" = "auth-broker" ] && [ "$2" = "import" ]; then',
+      `  printf '%s' "$(cat "$3")" >> ${JSON.stringify(importLog)}`,
+      '  printf \'{"dryRun":false,"imported":[{"provider":"openai-codex"}]}\';',
+      "  exit 0",
+      "fi",
+      "exit 1",
+      "",
+    ].join("\n"), { mode: 0o755 });
+    process.env.PATH = `${binDir}${path.delimiter}${previousPath}`;
+
+    const store = new PlanStore(path.join(root, "store"));
+    const accessToken = "header.eyJzdWIiOiJ1c2VyLW9uZSIsICJleHAiOiA0MTAyNDQ0ODAwLCAiY2hhdGdwdF9hY2NvdW50X2lkIjogImFjY291bnQtMTIzIn0.c2ln";
+    const codexPlan = await store.savePlan({
+      label: "ChatGPT",
+      provider: "codex",
+      codexAuthMode: "content",
+      authJsonContent: JSON.stringify({
+        tokens: {
+          access_token: accessToken,
+          refresh_token: "rotating-refresh",
+          account_id: "account-123",
+        },
+      }),
+    });
+
+    const result = await applyPlanToTarget(codexPlan.id, "ohmypi", ["gpt-5.6-sol"], store);
+    assert.equal(result.applied, true);
+    assert.ok(result.configPaths.some((candidate) => candidate.endsWith("config.yml")));
+
+    const imported = JSON.parse(await readFile(importLog, "utf8"));
+    assert.equal(imported.type, "codex");
+    assert.equal(imported.access_token, accessToken);
+    assert.equal(imported.refresh_token, "rotating-refresh");
+    assert.equal(imported.account_id, "account-123");
+    assert.ok(Number.isFinite(Date.parse(imported.expired)));
+
+    const config = parseYaml(await readFile(path.join(agentDir, "config.yml"), "utf8")) as Record<string, any>;
+    assert.equal(config.modelRoles.default, "openai-codex/gpt-5.6-sol");
+    assert.equal(await readFile(path.join(agentDir, "models.yml"), "utf8").then(() => true, () => false), false);
+    assert.equal((await store.getActiveTargets()).ohmypi.codex, codexPlan.id);
+    assert.ok(result.warnings.some((warning) => warning.includes("auth-broker")));
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("refuses Codex OAuth for Oh My Pi when omp is not installed", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-plan-ohmypi-codex-missing-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousPath = process.env.PATH;
+  process.env.PI_CODING_AGENT_DIR = path.join(root, "agent");
+  process.env.PATH = root;
+  try {
+    const store = new PlanStore(path.join(root, "store"));
+    const codexPlan = await store.savePlan({
+      label: "ChatGPT",
+      provider: "codex",
+      codexAuthMode: "content",
+      authJsonContent: JSON.stringify({
+        tokens: { access_token: "a.e30.b", refresh_token: "refresh" },
+      }),
+    });
+    const result = await applyPlanToTarget(codexPlan.id, "ohmypi", ["gpt-5.6-sol"], store);
+    assert.equal(result.applied, false);
+    assert.deepEqual(result.configPaths, []);
+    assert.match(result.message, /未检测到 omp/);
+    assert.ok(result.warnings.some((warning) => warning.includes("/login openai-codex")));
+    assert.equal((await store.getActiveTargets()).ohmypi.codex, null);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });
   }
 });

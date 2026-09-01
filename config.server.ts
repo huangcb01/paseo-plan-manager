@@ -1,6 +1,10 @@
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { unlink } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import {
   applyEdits,
   modify,
@@ -9,7 +13,9 @@ import {
   printParseErrorCode,
 } from "jsonc-parser/lib/esm/main.js";
 import { parse as parseToml } from "smol-toml";
+import { isMap, parseDocument, type Document, type ParsedNode, type YAMLMap } from "yaml";
 import type { Plan, Target } from "./plans.shared";
+import { targetModelParameterFields } from "./plans.shared";
 import {
   CLAUDE_AUTO_COMPACT_MIN,
   CLAUDE_AUTO_COMPACT_MAX,
@@ -54,6 +60,8 @@ export interface ToolAndPathState {
     codexAuth: string;
     opencodeConfig: string;
     claudeSettings: string;
+    ohmypiModels: string;
+    ohmypiConfig: string;
   };
 }
 
@@ -882,6 +890,175 @@ export function codexModelCatalog(
   }, null, 2)}\n`;
 }
 
+interface OhMyPiProviderProjection {
+  providerId: string;
+  displayName: string;
+  builtIn: boolean;
+  baseUrl?: string;
+  api?: string;
+}
+
+export function ohMyPiProjection(plan: Plan): OhMyPiProviderProjection {
+  if (plan.provider === "kimi") {
+    return { providerId: "kimi-code", displayName: "Kimi Coding", builtIn: true };
+  }
+  if (plan.provider !== "zhipu") {
+    throw new Error("Codex OAuth does not have an Oh My Pi provider projection");
+  }
+  if (plan.region === "global") {
+    return { providerId: "zai", displayName: "Zhipu GLM Global", builtIn: true };
+  }
+  if (plan.region === "cn-dev") {
+    return {
+      providerId: "zhipu-coding-plan-dev",
+      displayName: "Zhipu GLM Dev",
+      builtIn: false,
+      baseUrl: "https://dev.bigmodel.cn/api/coding/paas/v4",
+      api: "openai-completions",
+    };
+  }
+  return { providerId: "zhipu-coding-plan", displayName: "Zhipu GLM", builtIn: true };
+}
+
+function yamlDocument(text: string | undefined, description: string): Document.Parsed {
+  const doc = parseDocument(text?.trim() ? text : "");
+  if (doc.errors.length > 0) {
+    throw new Error(`${description} is not valid YAML: ${doc.errors[0].message}`);
+  }
+  if (doc.contents === undefined || doc.contents === null) {
+    doc.contents = doc.createNode({}) as unknown as ParsedNode;
+  } else if (!isMap(doc.contents)) {
+    throw new Error(`${description} must contain a YAML mapping`);
+  }
+  return doc;
+}
+
+function expectYamlMap(value: unknown, description: string): YAMLMap {
+  if (!isMap(value)) throw new Error(`${description} must be a YAML mapping`);
+  return value;
+}
+
+function createYamlMap(doc: Document.Parsed, parent: YAMLMap, key: string, description: string): YAMLMap {
+  const existing = parent.get(key);
+  if (existing === undefined || existing === null) {
+    parent.set(key, doc.createNode({}));
+    return expectYamlMap(parent.get(key), description);
+  }
+  return expectYamlMap(existing, description);
+}
+
+const OHMPI_OVERRIDE_FIELDS: Record<string, string> = {
+  "limit.context": "contextWindow",
+  "limit.output": "maxTokens",
+  "modalities.input": "input",
+  "reasoning": "reasoning",
+  "toolCall": "supportsTools",
+};
+
+function ohMyPiOverrideValues(
+  parameters: ModelCapabilityParameters,
+  editedFields: ReadonlySet<string>,
+): Record<string, unknown> {
+  const values: Record<string, unknown> = {};
+  for (const [field, key] of Object.entries(OHMPI_OVERRIDE_FIELDS)) {
+    if (!editedFields.has(field)) continue;
+    if (key === "contextWindow") values[key] = parameters.limit.context;
+    else if (key === "maxTokens") values[key] = parameters.limit.output;
+    else if (key === "input") {
+      values[key] = parameters.modalities.input.filter((modality) => modality === "text" || modality === "image");
+    } else if (key === "reasoning") values[key] = parameters.reasoning;
+    else if (key === "supportsTools") values[key] = parameters.toolCall;
+  }
+  return values;
+}
+
+export function patchOhMyPiModels(
+  text: string | undefined,
+  plan: Plan,
+  selectedModels: readonly string[],
+  apiKey: string,
+  modelParameters?: ReadonlyMap<string, ModelParameterPatch>,
+): string {
+  const models = normalizeModels(selectedModels, "Oh My Pi models");
+  if (plan.provider === "codex") {
+    throw new Error("Codex OAuth cannot be projected into Oh My Pi by file configuration");
+  }
+  nonEmpty(apiKey, "Oh My Pi API key");
+  const doc = yamlDocument(text, "Oh My Pi models.yml");
+  const providers = createYamlMap(doc, doc.contents as YAMLMap, "providers", "Oh My Pi models.yml providers");
+  const projection = ohMyPiProjection(plan);
+  const block = createYamlMap(
+    doc,
+    providers,
+    projection.providerId,
+    `Oh My Pi models.yml providers.${projection.providerId}`,
+  );
+  block.set("apiKey", apiKey);
+
+  if (projection.builtIn) {
+    // Built-in catalog providers must stay override-only: appending `models`
+    // without a baseUrl fails omp's schema validation and disables the file.
+    const overrides = models
+      .map((model) => ({ model, patch: modelParameters?.get(model) }))
+      .filter((entry): entry is { model: string; patch: ModelParameterPatch } => entry.patch !== undefined);
+    if (overrides.length > 0) {
+      const overridesMap = createYamlMap(
+        doc,
+        block,
+        "modelOverrides",
+        `Oh My Pi models.yml providers.${projection.providerId}.modelOverrides`,
+      );
+      for (const { model, patch } of overrides) {
+        const values = ohMyPiOverrideValues(patch.parameters, new Set(patch.fields));
+        const entry = createYamlMap(
+          doc,
+          overridesMap,
+          model,
+          `Oh My Pi models.yml modelOverrides.${model}`,
+        );
+        for (const [key, value] of Object.entries(values)) entry.set(key, value);
+      }
+    }
+  } else {
+    block.set("baseUrl", projection.baseUrl);
+    block.set("api", projection.api);
+    const entries = models.map((model) => {
+      const patch = modelParameters?.get(model);
+      const parameters = patch?.parameters ?? targetModelCapabilityParameters(
+        plan.provider === "zhipu" ? "zhipu" : "kimi",
+        "ohmypi",
+        model,
+      );
+      const input = parameters.modalities.input.filter((modality) => modality === "text" || modality === "image");
+      return {
+        id: model,
+        name: model,
+        contextWindow: parameters.limit.context,
+        maxTokens: parameters.limit.output,
+        reasoning: parameters.reasoning,
+        ...(input.length > 0 ? { input } : {}),
+        ...(patch?.fields.includes("toolCall") ? { supportsTools: parameters.toolCall } : {}),
+      };
+    });
+    block.set("models", doc.createNode(entries));
+  }
+
+  const updated = doc.toString();
+  return updated.endsWith("\n") ? updated : `${updated}\n`;
+}
+
+export function patchOhMyPiConfig(
+  text: string | undefined,
+  providerId: string,
+  model: string,
+): string {
+  const doc = yamlDocument(text, "Oh My Pi config.yml");
+  const modelRoles = createYamlMap(doc, doc.contents as YAMLMap, "modelRoles", "Oh My Pi config.yml modelRoles");
+  modelRoles.set("default", `${providerId}/${nonEmpty(model, "Oh My Pi default model")}`);
+  const updated = doc.toString();
+  return updated.endsWith("\n") ? updated : `${updated}\n`;
+}
+
 function opencodeConfigDirectory(): string {
   if (process.env.OPENCODE_CONFIG_DIR?.trim()) return expandHome(process.env.OPENCODE_CONFIG_DIR);
   const xdg = process.env.XDG_CONFIG_HOME?.trim()
@@ -926,23 +1103,42 @@ function claudeStatePath(): string {
   return path.join(homedir(), ".claude.json");
 }
 
+function ohMyPiAgentDirectory(): string {
+  return process.env.PI_CODING_AGENT_DIR?.trim()
+    ? expandHome(process.env.PI_CODING_AGENT_DIR)
+    : path.join(homedir(), ".omp", "agent");
+}
+
+function preferredYamlPath(directory: string, stem: string): string {
+  const yml = path.join(directory, `${stem}.yml`);
+  const yaml = path.join(directory, `${stem}.yaml`);
+  if (existsSync(yml)) return yml;
+  if (existsSync(yaml)) return yaml;
+  return yml;
+}
+
 export async function toolsAndPaths(): Promise<ToolAndPathState> {
-  const [opencode, codex, claude, openCodeConfig] = await Promise.all([
+  const [opencode, codex, claude, omp, openCodeConfig] = await Promise.all([
     findExecutable("opencode"),
     findExecutable("codex"),
     findExecutable("claude"),
+    findExecutable("omp"),
     opencodeConfigPath(),
   ]);
+  const ohMyPiAgent = ohMyPiAgentDirectory();
   return {
     tools: {
       opencode: { installed: Boolean(opencode), ...(opencode ? { executable: opencode } : {}) },
       codex: { installed: Boolean(codex), ...(codex ? { executable: codex } : {}) },
       claude: { installed: Boolean(claude), ...(claude ? { executable: claude } : {}) },
+      ohmypi: { installed: Boolean(omp), ...(omp ? { executable: omp } : {}) },
     },
     defaultPaths: {
       codexAuth: path.join(codexDirectory(), "auth.json"),
       opencodeConfig: openCodeConfig,
       claudeSettings: path.join(claudeDirectory(), "settings.json"),
+      ohmypiModels: preferredYamlPath(ohMyPiAgent, "models"),
+      ohmypiConfig: preferredYamlPath(ohMyPiAgent, "config"),
     },
   };
 }
@@ -1196,6 +1392,159 @@ async function applyClaude(
   };
 }
 
+const execFileAsync = promisify(execFile);
+
+export function ohMyPiCodexImportFile(plan: Plan, secret: CodexSecret): string {
+  const tokens = codexTokens(secret.auth);
+  const accountId = plan.accountId ?? codexAccountId(secret.auth);
+  const expires = accessTokenExpiry(secret.auth);
+  return `${JSON.stringify({
+    // CLIProxyAPI auth-dump shape consumed by `omp auth-broker import`;
+    // omp maps type "codex" onto its built-in openai-codex OAuth provider.
+    type: "codex",
+    access_token: String(tokens.access_token),
+    refresh_token: String(tokens.refresh_token),
+    expired: new Date(expires > 0 ? expires : Date.now()).toISOString(),
+    ...(accountId ? { account_id: accountId } : {}),
+  })}\n`;
+}
+
+interface OhMyPiImportOutcome {
+  accountId?: string;
+  brokered: boolean;
+}
+
+async function importCodexCredentialIntoOhMyPi(
+  executable: string,
+  plan: Plan,
+  secret: CodexSecret,
+): Promise<OhMyPiImportOutcome> {
+  const temporary = path.join(tmpdir(), `paseo-coding-plan-omp-${randomUUID()}.json`);
+  await atomicWriteFile(temporary, ohMyPiCodexImportFile(plan, secret), 0o600);
+  try {
+    const { stdout } = await execFileAsync(
+      executable,
+      ["auth-broker", "import", temporary, "--json"],
+      { timeout: 30_000, windowsHide: true, env: process.env },
+    );
+    const firstLine = stdout.split("\n", 1)[0]?.trim();
+    let parsed: {
+      imported?: Array<{ provider?: string }>;
+      error?: string;
+      broker?: unknown;
+    };
+    try {
+      parsed = firstLine ? JSON.parse(firstLine) : {};
+    } catch {
+      throw new Error(`omp auth-broker import returned unreadable output: ${firstLine ?? "(empty)"}`);
+    }
+    if (parsed.error) throw new Error(`omp auth-broker import failed: ${parsed.error}`);
+    if (!parsed.imported?.some((entry) => entry.provider === "openai-codex")) {
+      throw new Error("omp auth-broker import did not import an openai-codex credential");
+    }
+    return {
+      accountId: plan.accountId ?? codexAccountId(secret.auth),
+      brokered: false,
+    };
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+async function applyCodexPlanToOhMyPi(
+  plan: Plan,
+  secret: PlanSecret,
+  selectedModels: readonly string[],
+  tool: ToolStatus,
+): Promise<ApplyResult> {
+  if (secret.kind !== "codex-auth") throw new Error("Codex OAuth credential is missing");
+  if (!tool.executable) {
+    return {
+      planId: plan.id,
+      target: "ohmypi",
+      applied: false,
+      installed: tool.installed,
+      configPaths: [],
+      restartRequired: false,
+      message: "未写入 Oh My Pi：未检测到 omp 可执行文件，无法导入 ChatGPT OAuth 凭据。",
+      warnings: [
+        "安装 omp 后重试；或直接在 omp 会话中运行 /login openai-codex 完成官方 OAuth 登录。",
+      ],
+    };
+  }
+
+  const outcome = await importCodexCredentialIntoOhMyPi(tool.executable, plan, secret);
+  const agentDirectory = ohMyPiAgentDirectory();
+  const configPath = preferredYamlPath(agentDirectory, "config");
+  const configText = await readTextIfExists(configPath);
+  const nextConfig = patchOhMyPiConfig(configText, "openai-codex", selectedModels[0]);
+  await atomicWriteFile(configPath, nextConfig, 0o600);
+
+  const warnings = [
+    `已通过 omp auth-broker import 导入 ChatGPT OAuth 凭据${outcome.accountId ? `（account ...${outcome.accountId.slice(-8)}）` : ""}；配置了 auth broker 时会上传到 broker。`,
+    "导入后由 omp 自行刷新和轮换 refresh token；请勿让 Codex CLI / OpenCode 同时刷新同一旋转 refresh token。",
+    "同一 ChatGPT 账号（account_id）会原地更新；不同账号会加入 omp 的多账号轮换池，如需独占请在 omp 中 /logout openai-codex 移除旧账号。",
+    "openai-codex 模型目录由 omp 内置，插件不修改 models.yml。",
+    "已运行的 omp 进程不会自动重载凭据和 config.yml；请在新会话中使用。",
+  ];
+  return {
+    planId: plan.id,
+    target: "ohmypi",
+    applied: true,
+    installed: tool.installed,
+    configPaths: [path.join(agentDirectory, "agent.db"), configPath],
+    restartRequired: true,
+    message: `已将 ${plan.label} 配置到 Oh My Pi。`,
+    warnings,
+  };
+}
+
+async function applyOhMyPi(
+  plan: Plan,
+  secret: PlanSecret,
+  models: readonly string[],
+  modelParameters: ReadonlyMap<string, ModelParameterPatch>,
+  tool: ToolStatus,
+): Promise<ApplyResult> {
+  const installed = tool.installed;
+  const selectedModels = normalizeModels(models, "Oh My Pi models");
+  if (plan.provider === "codex") {
+    return applyCodexPlanToOhMyPi(plan, secret, selectedModels, tool);
+  }
+  if (secret.kind !== "api-key") throw new Error("API key is missing");
+  const agentDirectory = ohMyPiAgentDirectory();
+  const modelsPath = preferredYamlPath(agentDirectory, "models");
+  const configPath = preferredYamlPath(agentDirectory, "config");
+  const [modelsText, configText] = await Promise.all([
+    readTextIfExists(modelsPath),
+    readTextIfExists(configPath),
+  ]);
+  const projection = ohMyPiProjection(plan);
+  const nextModels = patchOhMyPiModels(modelsText, plan, selectedModels, secret.apiKey, modelParameters);
+  const nextConfig = patchOhMyPiConfig(configText, projection.providerId, selectedModels[0]);
+  await writePair(modelsPath, nextModels, configPath, nextConfig, {
+    expectedFirst: { text: modelsText },
+    expectedSecond: { text: configText },
+  });
+  const warnings = ["Oh My Pi 配置投影尚未在本机做端到端测试。"];
+  if (!installed) warnings.push("未检测到 omp 可执行文件；仅写入配置，没有安装 Oh My Pi。");
+  warnings.push("已运行的 omp 进程不会自动重载 models.yml / config.yml；请在新会话中使用。");
+  warnings.push("modelRoles.default 会覆盖你在 omp 中保存的默认模型；其他角色和其他设置保持不变。");
+  if (!projection.builtIn) {
+    warnings.push("智谱 Dev 区域没有 omp 内置 provider，插件写入自定义 provider zhipu-coding-plan-dev；该端点未经官方验证。");
+  }
+  return {
+    planId: plan.id,
+    target: "ohmypi",
+    applied: true,
+    installed,
+    configPaths: [modelsPath, configPath],
+    restartRequired: true,
+    message: `已将 ${plan.label} 配置到 Oh My Pi。`,
+    warnings,
+  };
+}
+
 export async function applyPlanToTarget(
   planId: string,
   target: Target,
@@ -1204,11 +1553,7 @@ export async function applyPlanToTarget(
   modelParameters: ReadonlyMap<string, ModelParameterPatch> = new Map(),
 ): Promise<ApplyResult> {
   const selectedModels = normalizeModels(models, "Target models");
-  const supportedFields = target === "codex"
-    ? new Set(["limit.context", "modalities.input", "reasoning"])
-    : target === "claude"
-      ? new Set(["limit.context"])
-      : undefined;
+  const supportedFields = targetModelParameterFields(target);
   const validatedModelParameters = new Map<string, ModelParameterPatch>();
   for (const [model, parameterPatch] of modelParameters) {
     if (!selectedModels.includes(model)) {
@@ -1255,7 +1600,9 @@ export async function applyPlanToTarget(
       ? await applyOpenCode(plan, secret, selectedModels, validatedModelParameters, installed)
       : target === "codex"
         ? await applyCodex(plan, secret, selectedModels, validatedModelParameters, installed)
-        : await applyClaude(plan, secret, selectedModels, validatedModelParameters, installed);
+        : target === "claude"
+          ? await applyClaude(plan, secret, selectedModels, validatedModelParameters, installed)
+          : await applyOhMyPi(plan, secret, selectedModels, validatedModelParameters, status.tools.ohmypi);
     return { result, applied: result.applied };
   });
 }

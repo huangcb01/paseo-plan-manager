@@ -1,6 +1,6 @@
 # Paseo Coding Plan Manager
 
-一个本地 Paseo 插件，用于集中管理多个 Codex / ChatGPT、智谱 GLM Coding Plan 和 Kimi Coding Plan，查看额度与重置时间，并把指定 Plan 写入 OpenCode、Codex 或 Claude Code 的本机配置。
+一个本地 Paseo 插件，用于集中管理多个 Codex / ChatGPT、智谱 GLM Coding Plan 和 Kimi Coding Plan，查看额度与重置时间，并把指定 Plan 写入 OpenCode、Codex、Claude Code 或 Oh My Pi 的本机配置。
 
 ## 功能
 
@@ -13,8 +13,8 @@
 - Codex 和智谱额外展示服务端 7/30 天 Token 活动；Kimi 每 5 分钟至多保存一个本地配额快照并保留 7 天。
 - 应用 Plan 时再为目标工具选择 1–16 个模型，首个作为当前默认；模型列表仅用于本次写入，不保存到 Plan。
 - 每个 API Key 模型可在写入前调整本次接入使用的能力 metadata；编辑范围会按目标工具实际支持的目录字段收窄。
-- 将所选模型写入 OpenCode 内置 coding plan provider（与 `opencode auth login` 合并）、智谱 Codex 模型目录或 Claude Code model picker，同时保留无关配置和 JSONC 注释。
-- 检测 `opencode`、`codex`、`claude` 是否存在；插件不包含、下载或安装任何 CLI。
+- 将所选模型写入 OpenCode 内置 coding plan provider（与 `opencode auth login` 合并）、智谱 Codex 模型目录、Claude Code model picker 或 Oh My Pi 的 models.yml / config.yml，同时保留无关配置和 JSONC / YAML 注释。
+- 检测 `opencode`、`codex`、`claude`、`omp` 是否存在；插件不包含、下载或安装任何 CLI。
 
 ## 右侧边栏
 
@@ -89,13 +89,13 @@ Codex 当前额度仍来自 `/backend-api/wham/usage`；按日 Token 活动来�
 
 点击 Plan 卡片上的“配置到…”后，插件会按 provider 和目标工具预填推荐模型。可在确认写入前选择并排序最多 16 个模型 ID；首个模型是目标工具的当前默认，整个列表仅用于本次配置，不会保存回 Coding Plan。
 
-每个智谱或 Kimi 模型行都有“参数”按钮。参数调整和模型选择一样只存在于当前写入草稿：OpenCode 可编辑 context/input/output、输入输出模态、推理、附件、工具调用、temperature 和 interleaved 字段；Codex 只映射 context、Codex 支持的输入模态和推理目录 metadata；Claude Code 只映射全局 context。ChatGPT OAuth 使用目标工具内置模型目录，因此显示“工具内置”，不伪造可编辑 metadata。
+每个智谱或 Kimi 模型行都有“参数”按钮。参数调整和模型选择一样只存在于当前写入草稿：OpenCode 可编辑 context/input/output、输入输出模态、推理、附件、工具调用、temperature 和 interleaved 字段；Codex 只映射 context、Codex 支持的输入模态和推理目录 metadata；Claude Code 只映射全局 context；Oh My Pi 映射 context/output、输入模态（text/image）、推理和工具调用。ChatGPT OAuth 使用目标工具内置模型目录，因此显示“工具内置”，不伪造可编辑 metadata。
 
-| Plan | OpenCode | Codex | Claude Code |
-| --- | --- | --- | --- |
-| Codex OAuth | 支持；首个模型为默认，不修改内置 OpenAI 目录 | 支持；首个模型为默认，写入原生 Codex auth，不修改内置目录 | 不直连；需要协议转换代理，插件会拒绝写入假配置 |
-| 智谱 API Key | 支持多模型目录，首个为默认 | 中国区和 Z.AI Global 支持原生 Responses 多模型目录；Dev 未验证 | 支持多模型 picker，未经端到端测试 |
-| Kimi API Key | 支持多模型目录，首个为默认 | 需要 Chat-to-Responses 代理，插件不写入 | 支持多模型 picker，未经端到端测试 |
+| Plan | OpenCode | Codex | Claude Code | Oh My Pi |
+| --- | --- | --- | --- | --- |
+| Codex OAuth | 支持；首个模型为默认，不修改内置 OpenAI 目录 | 支持；首个模型为默认，写入原生 Codex auth，不修改内置目录 | 不直连；需要协议转换代理，插件会拒绝写入假配置 | 支持；通过官方 `omp auth-broker import` 导入凭据，omp 原生刷新/轮换 |
+| 智谱 API Key | 支持多模型目录，首个为默认 | 中国区和 Z.AI Global 支持原生 Responses 多模型目录；Dev 未验证 | 支持多模型 picker，未经端到端测试 | 支持；中国区/Global 复用 omp 内置 provider，Dev 写入自定义 provider |
+| Kimi API Key | 支持多模型目录，首个为默认 | 需要 Chat-to-Responses 代理，插件不写入 | 支持多模型 picker，未经端到端测试 | 支持；复用 omp 内置 `kimi-code` provider |
 
 ### OpenCode
 
@@ -134,7 +134,23 @@ Codex OAuth 切换只支持 `cli_auth_credentials_store = "file"` 或未显式�
 
 ChatGPT Codex 后端是 OpenAI Responses 协议，Claude Code 发出 Anthropic Messages 协议，二者不能只靠环境变量直连。该组合会明确返回“未写入”，不会制造表面成功。
 
-> **未经测试声明：** 当前开发机未安装或未启动 Codex / Claude Code 做真实请求，两个目标的配置写入功能依据当前官方源码和 CC Switch 实现完成，并有格式级单元测试，但尚未做端到端验证。插件绝不会为了测试而安装这两个工具。
+### Oh My Pi
+
+路径遵循 omp 当前规则：
+
+- Agent 目录：`PI_CODING_AGENT_DIR`，否则 `~/.omp/agent`。
+- 模型目录：目录内已有的 `models.yml` 优先，其次 `models.yaml`，都不存在时创建 `models.yml`。
+- 设置：目录内已有的 `config.yml` 优先，其次 `config.yaml`，都不存在时创建 `config.yml`。
+
+智谱和 Kimi 复用 omp 内置 coding plan provider，只写入 `apiKey` 覆盖（该覆盖优先于存储凭据和环境变量，效果等同于 `/login` 后的 key）：中国区写入 `zhipu-coding-plan`，Z.AI Global 写入 `zai`，Kimi 写入 `kimi-code`。内置 provider 保持 override-only 形态——插件绝不向内置 provider 追加 `models`，因为缺少 `baseUrl` 的自定义模型会让 omp 拒绝整个 models.yml。模型能力由 omp 内置目录提供，未调整的模型显示“工具内置”；调整过的模型以 `modelOverrides` 写入稀疏覆盖（contextWindow、maxTokens、input、reasoning、supportsTools），已有的用户覆盖键保持不变。
+
+智谱 Dev 区域没有 omp 内置 provider，插件写入自定义 provider `zhipu-coding-plan-dev`（baseUrl `https://dev.bigmodel.cn/api/coding/paas/v4`、`api: openai-completions`）和完整模型目录；该端点未经官方验证。首个所选模型写入 `config.yml` 的 `modelRoles.default`（如 `kimi-code/k3`），这是 omp 的默认模型角色；其他角色、设置和 YAML 注释保持不变。写入 `modelRoles.default` 会覆盖你在 omp 中保存的默认模型。
+
+Codex OAuth 通过官方的 `omp auth-broker import` 导入：插件把 Plan 的 access/refresh token 和 account_id 写成 CLIProxyAPI auth-dump 格式（`type: "codex"`，omp 官方映射到内置 `openai-codex` OAuth provider）的临时文件（0600），调用 `omp auth-broker import <file> --json` 后立即删除；无需配置 auth broker 时凭据直接进入本机 `~/.omp/agent/agent.db`，配置了 broker 则上传到 broker。插件不直接写 SQLite——内部 schema（auth_schema_version）随版本演进，官方导入命令是唯一稳定的非交互入口。导入后 refresh token 由 omp 自行刷新和轮换；同一 ChatGPT 账号（account_id）原地更新，不同账号会加入 omp 的多账号轮换池（如需独占请在 omp 中 `/logout openai-codex`）。导入凭据需要 daemon 的 PATH 中存在 `omp`；未检测到时返回“未写入”并提示改用 `/login openai-codex`。首个所选模型仍写入 `modelRoles.default`（如 `openai-codex/gpt-5.6-sol`），模型目录使用 omp 内置 openai-codex 目录，不修改 models.yml。
+
+Oh My Pi 的 Active 状态与 OpenCode 一样按 provider 分槽保存：Codex、智谱和 Kimi 各自最多记录一个 Plan，智谱和 Kimi 的 `apiKey` 覆盖可以共存；`modelRoles.default` 始终只有一个，最近一次成功应用的 Plan 首个模型是当前默认。注意 omp 的 openai-codex 凭据是账号池语义：切到另一个 ChatGPT 账号不会自动移除旧凭据。已运行的 omp 进程不会自动重载 models.yml / config.yml 和凭据，切换后请新建会话。
+
+> **未经测试声明：** 当前开发机未安装或未启动 Codex / Claude Code 做真实请求，两个目标的配置写入功能依据当前官方源码和 CC Switch 实现完成，并有格式级单元测试，但尚未做端到端验证。Oh My Pi 的写入逻辑已用本机 `omp` 二进制做过加载级验证：models.yml / config.yml 的 provider、覆盖和 modelRoles 均被接受，Codex OAuth 走 `auth-broker import` 成功进入本机凭据库并让 openai-codex 模型可选；同样未发起真实模型请求。插件绝不会为了测试而安装这些工具。
 
 ## 数据与安全
 
@@ -159,7 +175,7 @@ secrets/<plan>.json # OAuth / API Key
 - 用量请求只允许预定义的精确 HTTPS hostname，禁用跨域 redirect，并限制响应体大小。
 - 成功快照会持久化；网络失败时界面显示旧数据和 `STALE`，不会把未知值伪装成 0。
 - `usage-cache.json` 写入前硬限制为 2 MiB，依次裁剪最旧的本地配额历史、Token 活动和超大快照；旧版本留下的超限文件会被当作空缓存恢复，不会阻塞 dashboard、刷新或删除操作。
-- `plans.json` 当前版本为 v4。有效的 v1/v2/v3 数据会在首次读取时直接升级到 v4：移除早期 Plan 中的目标模型字段，补充 Plan 级网络代理开关，并把 Active 状态校验到现有 Plan。v3 只记录了一个 OpenCode Plan，因此迁移只能依据该 Plan 元数据中的精确 provider 恢复对应的一个 provider 槽，无法恢复当时未记录的其他 OpenCode provider；不会根据 Plan ID 猜测 provider。Codex 和 Claude Code 仍分别迁移其单例引用。
+- `plans.json` 当前版本为 v5。有效的 v1/v2/v3/v4 数据会在首次读取时直接升级到 v5：v4 只是补充空的 Oh My Pi Active 槽位；更早版本还会移除早期 Plan 中的目标模型字段、补充 Plan 级网络代理开关，并把 Active 状态校验到现有 Plan。v3 只记录了一个 OpenCode Plan，因此迁移只能依据该 Plan 元数据中的精确 provider 恢复对应的一个 provider 槽，无法恢复当时未记录的其他 OpenCode provider；不会根据 Plan ID 猜测 provider。Codex 和 Claude Code 仍分别迁移其单例引用。
 
 配置写入采用同目录临时文件、`fsync` 和 rename。涉及 auth + config 两个文件时先写 auth，第二步失败会恢复 auth 快照；这能做到崩溃恢复友好，但操作系统不支持跨两个文件的全局原子事务。切换后建议新建 CLI 会话。
 
@@ -181,7 +197,7 @@ npm run typecheck
 npm test
 ```
 
-测试覆盖三个当前用量响应、Codex/智谱历史归一化、Kimi 快照节流与重置、多模型列表、OpenCode JSONC 多模型目录、Codex TOML/模型 metadata 以及 Claude Code 环境和 model picker 投影。
+测试覆盖三个当前用量响应、Codex/智谱历史归一化、Kimi 快照节流与重置、多模型列表、OpenCode JSONC 多模型目录、Codex TOML/模型 metadata、Claude Code 环境和 model picker 投影以及 Oh My Pi models.yml / config.yml 投影。
 
 ## 参考实现
 
@@ -192,5 +208,6 @@ npm test
 - [CC Switch](https://github.com/farion1231/cc-switch)
 - [OpenAI Codex](https://github.com/openai/codex)
 - [OpenCode](https://github.com/anomalyco/opencode)
+- [Oh My Pi](https://github.com/can1357/oh-my-pi)
 
 本项目没有复制上述项目的源码；它们用于核对接口、配置格式和安全边界。

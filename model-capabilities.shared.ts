@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export type CapabilityProvider = "zhipu" | "kimi";
-export type CapabilityTarget = "opencode" | "codex" | "claude";
+export type CapabilityTarget = "opencode" | "codex" | "claude" | "ohmypi";
 
 export const CLAUDE_AUTO_COMPACT_MIN = 100_000;
 export const CLAUDE_AUTO_COMPACT_MAX = 1_000_000;
