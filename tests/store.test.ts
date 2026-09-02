@@ -75,13 +75,14 @@ test("migrates each v3 OpenCode reference by exact Plan provider metadata", asyn
       const active = await store.getActiveTargets();
       const state = JSON.parse(await readFile(path.join(root, "plans.json"), "utf8"));
 
-      assert.equal(state.version, 4);
+      assert.equal(state.version, 5);
       assert.deepEqual(active, {
         opencode: {
           codex: selected.provider === "codex" ? selected.id : null,
           zhipu: selected.provider === "zhipu" ? selected.id : null,
           kimi: selected.provider === "kimi" ? selected.id : null,
         },
+        ohmypi: { codex: null, zhipu: null, kimi: null },
         codex: plans[1].id,
         claude: null,
       });
@@ -111,6 +112,7 @@ test("successful applies coexist by OpenCode provider and replace only the same 
     const stable = await store.getActiveTargets();
     assert.deepEqual(stable, {
       opencode: { codex: codex.id, zhipu: zhipuTwo.id, kimi: kimi.id },
+      ohmypi: { codex: null, zhipu: null, kimi: null },
       codex: zhipuOne.id,
       claude: kimi.id,
     });
@@ -151,6 +153,7 @@ test("editing and deleting clear a Plan from every slot without disturbing other
 
     assert.deepEqual(await store.getActiveTargets(), {
       opencode: { codex: codex.id, zhipu: null, kimi: kimi.id },
+      ohmypi: { codex: null, zhipu: null, kimi: null },
       codex: null,
       claude: kimi.id,
     });
@@ -158,9 +161,12 @@ test("editing and deleting clear a Plan from every slot without disturbing other
     await store.markActive("opencode", zhipu.id);
     await store.markActive("codex", codex.id);
     await store.markActive("claude", zhipu.id);
+    await store.markActive("ohmypi", zhipu.id);
+    await store.markActive("ohmypi", kimi.id);
     assert.equal(await store.deletePlan(zhipu.id), true);
     assert.deepEqual(await store.getActiveTargets(), {
       opencode: { codex: codex.id, zhipu: null, kimi: kimi.id },
+      ohmypi: { codex: null, zhipu: null, kimi: kimi.id },
       codex: codex.id,
       claude: null,
     });
@@ -193,6 +199,7 @@ test("v4 parsing rejects malformed, dangling, wrong-provider, and ambiguous refe
     const first = await store.getActiveTargets();
     assert.deepEqual(first, {
       opencode: { codex: "official", zhipu: null, kimi: null },
+      ohmypi: { codex: null, zhipu: null, kimi: null },
       codex: null,
       claude: null,
     });
@@ -204,6 +211,7 @@ test("v4 parsing rejects malformed, dangling, wrong-provider, and ambiguous refe
     assert.notStrictEqual(first.opencode, second.opencode);
     assert.deepEqual(second, {
       opencode: { codex: "official", zhipu: null, kimi: null },
+      ohmypi: { codex: null, zhipu: null, kimi: null },
       codex: null,
       claude: null,
     });

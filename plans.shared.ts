@@ -7,12 +7,17 @@ import {
 } from "./model-capabilities.shared";
 
 export const ProviderSchema = z.enum(["codex", "zhipu", "kimi"]);
-export const TargetSchema = z.enum(["opencode", "codex", "claude"]);
+export const TargetSchema = z.enum(["opencode", "codex", "claude", "ohmypi"]);
 export const ZhipuRegionSchema = z.enum(["cn", "global", "cn-dev"]);
 export const CodexAuthModeSchema = z.enum(["path", "content"]);
 
 export const ActiveTargetsSchema = z.object({
   opencode: z.object({
+    codex: z.string().nullable(),
+    zhipu: z.string().nullable(),
+    kimi: z.string().nullable(),
+  }),
+  ohmypi: z.object({
     codex: z.string().nullable(),
     zhipu: z.string().nullable(),
     kimi: z.string().nullable(),
@@ -116,11 +121,14 @@ export const DashboardSchema = z.object({
     opencode: ToolStatusSchema,
     codex: ToolStatusSchema,
     claude: ToolStatusSchema,
+    ohmypi: ToolStatusSchema,
   }),
   defaultPaths: z.object({
     codexAuth: z.string(),
     opencodeConfig: z.string(),
     claudeSettings: z.string(),
+    ohmypiModels: z.string(),
+    ohmypiConfig: z.string(),
   }),
   storagePath: z.string(),
 });
@@ -138,6 +146,21 @@ export const SavePlanInputSchema = z.object({
   useProxy: z.boolean().optional(),
 });
 
+export const OHMPI_MODEL_PARAMETER_FIELDS = new Set([
+  "limit.context",
+  "limit.output",
+  "modalities.input",
+  "reasoning",
+  "toolCall",
+]);
+
+export function targetModelParameterFields(target: Target): Set<string> | undefined {
+  if (target === "codex") return new Set(["limit.context", "modalities.input", "reasoning"]);
+  if (target === "claude") return new Set(["limit.context"]);
+  if (target === "ohmypi") return new Set(OHMPI_MODEL_PARAMETER_FIELDS);
+  return undefined;
+}
+
 export const ApplyPlanInputSchema = z.object({
   planId: z.string(),
   target: TargetSchema,
@@ -147,11 +170,7 @@ export const ApplyPlanInputSchema = z.object({
     .transform((models) => [...new Set(models)]),
   modelParameters: z.array(ModelParameterOverrideSchema).max(16).optional(),
 }).superRefine((input, context) => {
-  const supportedFields = input.target === "codex"
-    ? new Set(["limit.context", "modalities.input", "reasoning"])
-    : input.target === "claude"
-      ? new Set(["limit.context"])
-      : undefined;
+  const supportedFields = targetModelParameterFields(input.target);
   const seen = new Set<string>();
   for (const [index, override] of (input.modelParameters ?? []).entries()) {
     const editedFields = new Set(override.fields);
@@ -187,6 +206,17 @@ export const ApplyPlanInputSchema = z.object({
         code: "custom",
         path: ["modelParameters", index, "parameters", "limit", "context"],
         message: "Claude [1m] model IDs have a fixed 1000000 token context",
+      });
+    }
+    if (
+      input.target === "ohmypi" &&
+      editedFields.has("modalities.input") &&
+      override.parameters.modalities.input.some((modality) => modality !== "text" && modality !== "image")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["modelParameters", index, "parameters", "modalities", "input"],
+        message: "Oh My Pi only maps text and image input modalities",
       });
     }
     if (input.target === "codex" && isKnownCapabilityModel("zhipu", override.model)) {
