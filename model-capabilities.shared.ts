@@ -202,6 +202,13 @@ export function targetModelCapabilityParameters(
       : provider === "kimi"
         ? 262_144
         : 200_000;
+  } else if (target === "ohmypi") {
+    // omp's model schema only maps text and image inputs; strip modalities
+    // (e.g. Kimi's video) that its editor chips cannot represent, otherwise
+    // an untouched draft would fail ApplyPlanInputSchema validation.
+    parameters.modalities.input = parameters.modalities.input.filter(
+      (modality) => modality === "text" || modality === "image",
+    );
   }
   return parameters;
 }

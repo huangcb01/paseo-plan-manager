@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after, before } from "node:test";
 import { parse } from "jsonc-parser";
 import { parse as parseYaml } from "yaml";
 import {
@@ -23,6 +23,26 @@ import {
 } from "../model-capabilities.shared";
 import type { Plan } from "../plans.shared";
 import { PlanStore, type PlanSecret } from "../store.server";
+
+// The apply tests exercise real file writes; content-injection env vars set by
+// a hosting editor (e.g. an opencode-managed session) make applyOpenCode refuse
+// to run, so keep the suite hermetic by clearing them for this process.
+const OPENCODE_INJECTED_ENV = ["OPENCODE_CONFIG_CONTENT", "OPENCODE_AUTH_CONTENT"] as const;
+const savedOpencodeEnv = new Map<string, string | undefined>();
+
+before(() => {
+  for (const name of OPENCODE_INJECTED_ENV) {
+    savedOpencodeEnv.set(name, process.env[name]);
+    delete process.env[name];
+  }
+});
+
+after(() => {
+  for (const [name, value] of savedOpencodeEnv) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+});
 
 function plan(provider: Plan["provider"]): Plan {
   return {
@@ -1711,4 +1731,82 @@ test("refuses Codex OAuth for Oh My Pi when omp is not installed", async () => {
     process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("marks plugin-written modelOverrides and cleans them up on later applies", () => {
+  const parameters = structuredClone(modelCapabilityParameters("zhipu", "glm-5.3"));
+  parameters.limit.context = 900_000;
+  const patch = modelPatch(parameters, ["limit.context"]);
+
+  const first = patchOhMyPiModels(undefined, plan("zhipu"), ["glm-5.3"], "secret", new Map([
+    ["glm-5.3", patch],
+  ]));
+  assert.match(first, /# managed by paseo-coding-plan-manager/);
+
+  // Later apply of the same provider without parameter edits drops the
+  // plugin-written override entirely instead of leaving stale values behind.
+  const second = patchOhMyPiModels(first, plan("zhipu"), ["glm-5.3"], "secret-2");
+  const parsed = parseYaml(second) as Record<string, any>;
+  assert.equal(parsed.providers["zhipu-coding-plan"].apiKey, "secret-2");
+  assert.equal(parsed.providers["zhipu-coding-plan"].modelOverrides, undefined);
+});
+
+test("rewrites managed overrides when the edited field set shrinks and preserves user entries", () => {
+  const source = `providers:
+  zhipu-coding-plan:
+    apiKey: old
+    modelOverrides:
+      # managed by paseo-coding-plan-manager
+      glm-5.3:
+        contextWindow: 999000
+        reasoning: false
+        name: User label
+      glm-5.1:
+        name: Pure user entry
+`;
+  const parameters = structuredClone(modelCapabilityParameters("zhipu", "glm-5.3"));
+  parameters.limit.context = 777_000;
+  const output = patchOhMyPiModels(source, plan("zhipu"), ["glm-5.3"], "secret", new Map([
+    ["glm-5.3", modelPatch(parameters, ["limit.context"])],
+  ]));
+  const parsed = parseYaml(output) as Record<string, any>;
+  const overrides = parsed.providers["zhipu-coding-plan"].modelOverrides;
+  assert.deepEqual(overrides["glm-5.3"], { contextWindow: 777_000, name: "User label" });
+  assert.deepEqual(overrides["glm-5.1"], { name: "Pure user entry" });
+
+  // Dropping all edits removes only the managed entry; user entries stay.
+  const cleared = patchOhMyPiModels(output, plan("zhipu"), ["glm-5.3"], "secret");
+  const clearedParsed = parseYaml(cleared) as Record<string, any>;
+  assert.deepEqual(clearedParsed.providers["zhipu-coding-plan"].modelOverrides, {
+    "glm-5.1": { name: "Pure user entry" },
+  });
+});
+
+test("merges patches into user-owned override entries without claiming ownership", () => {
+  const source = `providers:
+  zhipu-coding-plan:
+    apiKey: old
+    modelOverrides:
+      glm-5.1:
+        name: User entry
+`;
+  const parameters = structuredClone(modelCapabilityParameters("zhipu", "glm-5.1"));
+  parameters.limit.context = 150_000;
+  const output = patchOhMyPiModels(source, plan("zhipu"), ["glm-5.1"], "secret", new Map([
+    ["glm-5.1", modelPatch(parameters, ["limit.context"])],
+  ]));
+  const parsed = parseYaml(output) as Record<string, any>;
+  assert.deepEqual(parsed.providers["zhipu-coding-plan"].modelOverrides["glm-5.1"], {
+    name: "User entry",
+    contextWindow: 150_000,
+  });
+  assert.doesNotMatch(output, /managed by paseo-coding-plan-manager/);
+
+  // A later apply without edits keeps the merged entry: it is user-owned now.
+  const again = patchOhMyPiModels(output, plan("zhipu"), ["glm-5.1"], "secret");
+  const againParsed = parseYaml(again) as Record<string, any>;
+  assert.deepEqual(againParsed.providers["zhipu-coding-plan"].modelOverrides["glm-5.1"], {
+    name: "User entry",
+    contextWindow: 150_000,
+  });
 });

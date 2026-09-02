@@ -13,7 +13,7 @@ import {
   printParseErrorCode,
 } from "jsonc-parser/lib/esm/main.js";
 import { parse as parseToml } from "smol-toml";
-import { isMap, parseDocument, type Document, type ParsedNode, type YAMLMap } from "yaml";
+import { isMap, parseDocument, Scalar, type Document, type Pair, type ParsedNode, type YAMLMap } from "yaml";
 import type { Plan, Target } from "./plans.shared";
 import { targetModelParameterFields } from "./plans.shared";
 import {
@@ -892,7 +892,6 @@ export function codexModelCatalog(
 
 interface OhMyPiProviderProjection {
   providerId: string;
-  displayName: string;
   builtIn: boolean;
   baseUrl?: string;
   api?: string;
@@ -900,24 +899,23 @@ interface OhMyPiProviderProjection {
 
 export function ohMyPiProjection(plan: Plan): OhMyPiProviderProjection {
   if (plan.provider === "kimi") {
-    return { providerId: "kimi-code", displayName: "Kimi Coding", builtIn: true };
+    return { providerId: "kimi-code", builtIn: true };
   }
   if (plan.provider !== "zhipu") {
     throw new Error("Codex OAuth does not have an Oh My Pi provider projection");
   }
   if (plan.region === "global") {
-    return { providerId: "zai", displayName: "Zhipu GLM Global", builtIn: true };
+    return { providerId: "zai", builtIn: true };
   }
   if (plan.region === "cn-dev") {
     return {
       providerId: "zhipu-coding-plan-dev",
-      displayName: "Zhipu GLM Dev",
       builtIn: false,
       baseUrl: "https://dev.bigmodel.cn/api/coding/paas/v4",
       api: "openai-completions",
     };
   }
-  return { providerId: "zhipu-coding-plan", displayName: "Zhipu GLM", builtIn: true };
+  return { providerId: "zhipu-coding-plan", builtIn: true };
 }
 
 function yamlDocument(text: string | undefined, description: string): Document.Parsed {
@@ -954,6 +952,52 @@ const OHMPI_OVERRIDE_FIELDS: Record<string, string> = {
   "reasoning": "reasoning",
   "toolCall": "supportsTools",
 };
+
+// Entries the plugin creates carry this marker comment so later applies can
+// rewrite or drop them; entries without it are user-owned and never removed.
+const OHMPI_MANAGED_OVERRIDE_MARKER = "managed by paseo-coding-plan-manager";
+const OHMPI_MANAGED_OVERRIDE_KEYS = new Set(Object.values(OHMPI_OVERRIDE_FIELDS));
+
+function commentHasManagedMarker(comment: string | null | undefined): boolean {
+  if (typeof comment !== "string") return false;
+  return comment.split("\n").some((line) => line.trim() === OHMPI_MANAGED_OVERRIDE_MARKER);
+}
+
+function yamlEntryKey(pair: Pair): { value?: unknown; commentBefore?: string | null } {
+  const key = pair.key;
+  if (key && typeof key === "object") return key as { value?: unknown; commentBefore?: string | null };
+  return { value: key };
+}
+
+function isManagedOverrideEntry(overridesMap: YAMLMap, index: number): boolean {
+  const pair = overridesMap.items[index];
+  if (!pair) return false;
+  if (commentHasManagedMarker(yamlEntryKey(pair).commentBefore)) return true;
+  // A comment above the collection's first entry is stored on the parent map
+  // once the file is parsed again, so the marker can live in either place.
+  return index === 0 && commentHasManagedMarker(overridesMap.commentBefore);
+}
+
+function markOverrideEntryManaged(pair: Pair): void {
+  // Plain-string keys set through YAMLMap.set are primitives; comments can
+  // only attach to nodes, so promote the key to a Scalar first.
+  if (!pair.key || typeof pair.key !== "object") {
+    pair.key = new Scalar(yamlMapKey(pair));
+  }
+  (pair.key as { commentBefore?: string | null }).commentBefore = ` ${OHMPI_MANAGED_OVERRIDE_MARKER}`;
+}
+
+function stripManagedMarkerFromMapComment(overridesMap: YAMLMap): void {
+  if (typeof overridesMap.commentBefore !== "string") return;
+  const lines = overridesMap.commentBefore
+    .split("\n")
+    .filter((line) => line.trim() !== OHMPI_MANAGED_OVERRIDE_MARKER);
+  overridesMap.commentBefore = lines.length > 0 ? lines.join("\n") : undefined;
+}
+
+function yamlMapKey(pair: Pair): string {
+  return String(yamlEntryKey(pair).value ?? pair.key);
+}
 
 function ohMyPiOverrideValues(
   parameters: ModelCapabilityParameters,
@@ -998,26 +1042,76 @@ export function patchOhMyPiModels(
   if (projection.builtIn) {
     // Built-in catalog providers must stay override-only: appending `models`
     // without a baseUrl fails omp's schema validation and disables the file.
-    const overrides = models
-      .map((model) => ({ model, patch: modelParameters?.get(model) }))
-      .filter((entry): entry is { model: string; patch: ModelParameterPatch } => entry.patch !== undefined);
-    if (overrides.length > 0) {
-      const overridesMap = createYamlMap(
-        doc,
-        block,
-        "modelOverrides",
+    const patches = new Map<string, ModelParameterPatch>();
+    for (const model of models) {
+      const patch = modelParameters?.get(model);
+      if (patch) patches.set(model, patch);
+    }
+
+    const existingOverrides = block.get("modelOverrides");
+    if (existingOverrides !== undefined && existingOverrides !== null && !isMap(existingOverrides)) {
+      throw new Error(`Oh My Pi models.yml providers.${projection.providerId}.modelOverrides must be a mapping`);
+    }
+    let overridesMap = isMap(existingOverrides) ? existingOverrides : undefined;
+    if (!overridesMap && patches.size > 0) {
+      block.set("modelOverrides", doc.createNode({}));
+      overridesMap = expectYamlMap(
+        block.get("modelOverrides"),
         `Oh My Pi models.yml providers.${projection.providerId}.modelOverrides`,
       );
-      for (const { model, patch } of overrides) {
-        const values = ohMyPiOverrideValues(patch.parameters, new Set(patch.fields));
-        const entry = createYamlMap(
-          doc,
-          overridesMap,
-          model,
+    }
+
+    if (overridesMap) {
+      // Rewrite or drop entries the plugin created earlier (marker comment);
+      // user-written entries without the marker are never modified here.
+      for (let index = overridesMap.items.length - 1; index >= 0; index -= 1) {
+        const pair = overridesMap.items[index];
+        const model = yamlMapKey(pair);
+        if (!isManagedOverrideEntry(overridesMap, index)) continue;
+        const patch = patches.get(model);
+        if (!patch) {
+          overridesMap.delete(model);
+          if (index === 0) stripManagedMarkerFromMapComment(overridesMap);
+          continue;
+        }
+        const entry = expectYamlMap(
+          pair.value,
           `Oh My Pi models.yml modelOverrides.${model}`,
         );
+        for (const key of OHMPI_MANAGED_OVERRIDE_KEYS) entry.delete(key);
+        for (const [key, value] of Object.entries(
+          ohMyPiOverrideValues(patch.parameters, new Set(patch.fields)),
+        )) {
+          entry.set(key, value);
+        }
+        if (entry.items.length === 0) {
+          overridesMap.delete(model);
+          if (index === 0) stripManagedMarkerFromMapComment(overridesMap);
+        }
+        patches.delete(model);
+      }
+
+      // Remaining patches target missing or user-owned entries: create plugin
+      // entries with the marker, or merge into user entries while preserving
+      // their keys (those are never auto-removed later).
+      for (const [model, patch] of patches) {
+        const values = ohMyPiOverrideValues(patch.parameters, new Set(patch.fields));
+        const current = overridesMap.get(model);
+        if (current !== undefined && current !== null && !isMap(current)) {
+          throw new Error(`Oh My Pi models.yml modelOverrides.${model} must be a mapping`);
+        }
+        if (isMap(current)) {
+          for (const [key, value] of Object.entries(values)) current.set(key, value);
+          continue;
+        }
+        overridesMap.set(model, doc.createNode({}));
+        const pair = overridesMap.items.find((candidate) => yamlMapKey(candidate) === model);
+        if (pair) markOverrideEntryManaged(pair);
+        const entry = expectYamlMap(overridesMap.get(model), `Oh My Pi models.yml modelOverrides.${model}`);
         for (const [key, value] of Object.entries(values)) entry.set(key, value);
       }
+
+      if (overridesMap.items.length === 0) block.delete("modelOverrides");
     }
   } else {
     block.set("baseUrl", projection.baseUrl);
@@ -1411,7 +1505,6 @@ export function ohMyPiCodexImportFile(plan: Plan, secret: CodexSecret): string {
 
 interface OhMyPiImportOutcome {
   accountId?: string;
-  brokered: boolean;
 }
 
 async function importCodexCredentialIntoOhMyPi(
@@ -1431,7 +1524,6 @@ async function importCodexCredentialIntoOhMyPi(
     let parsed: {
       imported?: Array<{ provider?: string }>;
       error?: string;
-      broker?: unknown;
     };
     try {
       parsed = firstLine ? JSON.parse(firstLine) : {};
@@ -1444,7 +1536,6 @@ async function importCodexCredentialIntoOhMyPi(
     }
     return {
       accountId: plan.accountId ?? codexAccountId(secret.auth),
-      brokered: false,
     };
   } finally {
     await unlink(temporary).catch(() => undefined);
@@ -1478,6 +1569,13 @@ async function applyCodexPlanToOhMyPi(
   const configPath = preferredYamlPath(agentDirectory, "config");
   const configText = await readTextIfExists(configPath);
   const nextConfig = patchOhMyPiConfig(configText, "openai-codex", selectedModels[0]);
+  // The credential import deliberately runs first: if this config write then
+  // fails, omp still holds a usable credential without a default-model role,
+  // and retrying is idempotent because the same account_id upserts in place.
+  const configSnapshot = await captureFile(configPath);
+  if (snapshotText(configSnapshot) !== configText) {
+    throw new Error(`Configuration changed concurrently: ${configPath}`);
+  }
   await atomicWriteFile(configPath, nextConfig, 0o600);
 
   const warnings = [
@@ -1486,6 +1584,7 @@ async function applyCodexPlanToOhMyPi(
     "同一 ChatGPT 账号（account_id）会原地更新；不同账号会加入 omp 的多账号轮换池，如需独占请在 omp 中 /logout openai-codex 移除旧账号。",
     "openai-codex 模型目录由 omp 内置，插件不修改 models.yml。",
     "已运行的 omp 进程不会自动重载凭据和 config.yml；请在新会话中使用。",
+    "Codex OAuth 导入路径已做加载级验证，尚未发起真实模型请求做端到端测试。",
   ];
   return {
     planId: plan.id,
@@ -1526,7 +1625,7 @@ async function applyOhMyPi(
     expectedFirst: { text: modelsText },
     expectedSecond: { text: configText },
   });
-  const warnings = ["Oh My Pi 配置投影尚未在本机做端到端测试。"];
+  const warnings = ["Oh My Pi 配置投影已用本机 omp 二进制做加载级验证，尚未发起真实模型请求做端到端测试。"];
   if (!installed) warnings.push("未检测到 omp 可执行文件；仅写入配置，没有安装 Oh My Pi。");
   warnings.push("已运行的 omp 进程不会自动重载 models.yml / config.yml；请在新会话中使用。");
   warnings.push("modelRoles.default 会覆盖你在 omp 中保存的默认模型；其他角色和其他设置保持不变。");

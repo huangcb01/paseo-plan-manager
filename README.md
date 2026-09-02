@@ -142,7 +142,9 @@ ChatGPT Codex 后端是 OpenAI Responses 协议，Claude Code 发出 Anthropic M
 - 模型目录：目录内已有的 `models.yml` 优先，其次 `models.yaml`，都不存在时创建 `models.yml`。
 - 设置：目录内已有的 `config.yml` 优先，其次 `config.yaml`，都不存在时创建 `config.yml`。
 
-智谱和 Kimi 复用 omp 内置 coding plan provider，只写入 `apiKey` 覆盖（该覆盖优先于存储凭据和环境变量，效果等同于 `/login` 后的 key）：中国区写入 `zhipu-coding-plan`，Z.AI Global 写入 `zai`，Kimi 写入 `kimi-code`。内置 provider 保持 override-only 形态——插件绝不向内置 provider 追加 `models`，因为缺少 `baseUrl` 的自定义模型会让 omp 拒绝整个 models.yml。模型能力由 omp 内置目录提供，未调整的模型显示“工具内置”；调整过的模型以 `modelOverrides` 写入稀疏覆盖（contextWindow、maxTokens、input、reasoning、supportsTools），已有的用户覆盖键保持不变。
+智谱和 Kimi 复用 omp 内置 coding plan provider，只写入 `apiKey` 覆盖（该覆盖优先于存储凭据和环境变量，效果等同于 `/login` 后的 key）：中国区写入 `zhipu-coding-plan`，Z.AI Global 写入 `zai`，Kimi 写入 `kimi-code`。内置 provider 保持 override-only 形态——插件绝不向内置 provider 追加 `models`，因为缺少 `baseUrl` 的自定义模型会让 omp 拒绝整个 models.yml。模型能力由 omp 内置目录提供，未调整的模型显示“工具内置”；调整过的模型以 `modelOverrides` 写入稀疏覆盖（contextWindow、maxTokens、input、reasoning、supportsTools）。
+
+`modelOverrides` 的生命周期分两类：插件创建的条目带 `# managed by paseo-coding-plan-manager` 注释标记，后续应用会改写或移除它们（取消全部调整即删除该条目，未再选择的模型也会清理）；用户手写的无标记条目永远保持原样，插件向其合并新值后也不再自动移除。
 
 智谱 Dev 区域没有 omp 内置 provider，插件写入自定义 provider `zhipu-coding-plan-dev`（baseUrl `https://dev.bigmodel.cn/api/coding/paas/v4`、`api: openai-completions`）和完整模型目录；该端点未经官方验证。首个所选模型写入 `config.yml` 的 `modelRoles.default`（如 `kimi-code/k3`），这是 omp 的默认模型角色；其他角色、设置和 YAML 注释保持不变。写入 `modelRoles.default` 会覆盖你在 omp 中保存的默认模型。
 

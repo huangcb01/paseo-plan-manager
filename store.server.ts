@@ -32,8 +32,12 @@ interface StoreState {
 
 type LegacyPlanV2 = Omit<Plan, "useProxy">;
 
+// v1 stores predate the ohmypi target; their per-target model map only ever
+// held the three original targets, so type it narrowly instead of via Target.
+type LegacyV1Target = "opencode" | "codex" | "claude";
+
 interface LegacyPlanV1 extends LegacyPlanV2 {
-  models: Record<Target, string>;
+  models: Record<LegacyV1Target, string>;
 }
 
 export interface CodexSecret {

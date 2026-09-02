@@ -1505,7 +1505,9 @@ function ModelParameterEditor({
           output,
         },
         modalities: {
-          input: openCode || codex || ohMyPi ? draft.inputModalities : [...parameters.modalities.input],
+          input: openCode || codex || ohMyPi
+            ? draft.inputModalities.filter((modality) => !ohMyPi || availableInputModalities.includes(modality))
+            : [...parameters.modalities.input],
           output: openCode ? draft.outputModalities : [...parameters.modalities.output],
         },
         reasoning: openCode || codex || ohMyPi ? draft.reasoning : parameters.reasoning,
@@ -2995,9 +2997,9 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
         {dashboard ? (
           <View style={styles.footer}>
             <Text style={styles.footerText}>插件数据：{dashboard.storagePath}</Text>
-              <Text style={styles.footerText}>
-                Codex / Claude Code / Oh My Pi 配置功能已实现；Codex 与 Claude Code 未经本机端到端测试。插件不会安装任何 CLI；未检测到工具时只会按你的按钮操作写入配置。
-              </Text>
+            <Text style={styles.footerText}>
+              Codex / Claude Code / Oh My Pi 配置功能已实现：Codex 与 Claude Code 未经本机端到端测试，Oh My Pi 已做加载级验证。插件不会安装任何 CLI；未检测到工具时只会按你的按钮操作写入配置。
+            </Text>
           </View>
         ) : null}
       </ScrollView>

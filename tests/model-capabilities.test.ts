@@ -30,6 +30,25 @@ test("uses target-specific context defaults without mutating OpenCode metadata",
   assert.equal(targetModelCapabilityParameters("kimi", "claude", "k3").limit.context, 1_048_576);
 });
 
+test("narrows Oh My Pi input modalities to what omp can map", () => {
+  assert.deepEqual(
+    targetModelCapabilityParameters("kimi", "ohmypi", "k3").modalities.input,
+    ["text", "image"],
+  );
+  assert.deepEqual(
+    targetModelCapabilityParameters("kimi", "ohmypi", "kimi-for-coding").modalities.input,
+    ["text", "image"],
+  );
+  assert.deepEqual(
+    targetModelCapabilityParameters("zhipu", "ohmypi", "glm-5.3").modalities.input,
+    ["text"],
+  );
+  assert.deepEqual(
+    targetModelCapabilityParameters("kimi", "opencode", "k3").modalities.input,
+    ["text", "image", "video"],
+  );
+});
+
 test("marks unknown models and leaves sparse limit relationships to target projection", () => {
   assert.equal(isKnownCapabilityModel("zhipu", "glm-5.3"), true);
   assert.equal(isKnownCapabilityModel("zhipu", "private-glm"), false);
