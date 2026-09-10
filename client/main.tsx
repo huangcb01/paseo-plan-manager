@@ -1,4 +1,4 @@
-import { type PluginWorkspacePanelProps, useRpc } from "@getpaseo/plugin";
+import { type PluginWorkspacePanelProps, useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useMemo, useState } from "react";
 import {
@@ -16,7 +16,6 @@ import {
   getDashboard,
   refreshUsage,
   savePlan,
-  type ApplyPlanInput,
   type ApplyPlanResult,
   type CodexAuthMode,
   type Dashboard,
@@ -30,7 +29,7 @@ import {
   type UsageSnapshot,
   type UsageWindow,
   type ZhipuRegion,
-} from "./plans.shared";
+} from "../shared/plans";
 import {
   CLAUDE_AUTO_COMPACT_MAX,
   estimatedOpenCodeCompactionThreshold,
@@ -43,7 +42,7 @@ import {
   type ModelInterleavedField,
   type ModelModality,
   type ModelParameterOverride,
-} from "./model-capabilities.shared";
+} from "../shared/model-capabilities";
 
 interface EditorState {
   id?: string;
@@ -2670,11 +2669,11 @@ export function CodingPlansWorkspacePanel({ theme, host, layout }: PluginWorkspa
   const compact = layout.compact || (panelWidth !== null && panelWidth < 800);
   const styles = useMemo(() => createStyles(theme, compact), [theme, compact]);
   const queryClient = useQueryClient();
-  const dashboardRpc = useRpc(getDashboard) as (_input: Record<string, never>) => Promise<Dashboard>;
-  const saveRpc = useRpc(savePlan) as (input: SavePlanInput) => Promise<Plan>;
-  const deleteRpc = useRpc(deletePlan) as (input: { planId: string }) => Promise<{ deleted: boolean }>;
-  const refreshRpc = useRpc(refreshUsage) as (input: { planId?: string }) => Promise<{ usage: UsageSnapshot[] }>;
-  const applyRpc = useRpc(applyPlan) as (input: ApplyPlanInput) => Promise<ApplyPlanResult>;
+  const dashboardRpc = useRpc(getDashboard);
+  const saveRpc = useRpc(savePlan);
+  const deleteRpc = useRpc(deletePlan);
+  const refreshRpc = useRpc(refreshUsage);
+  const applyRpc = useRpc(applyPlan);
   const queryKey = ["coding-plan-manager", host.id, "dashboard"] as const;
   const usageKey = ["coding-plan-manager", host.id, "usage"] as const;
   const [editor, setEditor] = useState<EditorState | null>(null);

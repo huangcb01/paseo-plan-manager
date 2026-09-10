@@ -13,7 +13,7 @@ import type {
   TokenActivityPoint,
   UsageSnapshot,
   UsageWindow,
-} from "./plans.shared";
+} from "../shared/plans";
 import {
   codexAccountId,
   codexTokens,
@@ -21,7 +21,7 @@ import {
   type PlanSecret,
   type PlanStore,
   planStore,
-} from "./store.server";
+} from "./store";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 6_000;

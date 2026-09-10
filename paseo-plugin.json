@@ -1,3 +1,6 @@
 {
-  "id": "coding-plan-manager"
+  "id": "coding-plan-manager",
+  "requirements": {
+    "paseo": "^0.8.0"
+  }
 }

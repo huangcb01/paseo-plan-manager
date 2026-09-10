@@ -7,7 +7,7 @@ import {
   ModelCapabilityParametersSchema,
   ModelParameterOverrideSchema,
   targetModelCapabilityParameters,
-} from "../model-capabilities.shared";
+} from "../shared/model-capabilities";
 
 test("provides isolated known model defaults and OpenCode compaction estimates", () => {
   const parameters = modelCapabilityParameters("kimi", "kimi-for-coding");

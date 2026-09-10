@@ -1,7 +1,7 @@
-import type { ApplyPlanInput, SavePlanInput } from "./plans.shared";
-import { applyPlanToTarget, toolsAndPaths } from "./config.server";
-import { planStore } from "./store.server";
-import { cachedUsage, refreshUsageSnapshots } from "./usage.server";
+import type { ApplyPlanInput, SavePlanInput } from "../shared/plans";
+import { applyPlanToTarget, toolsAndPaths } from "./config";
+import { planStore } from "./store";
+import { cachedUsage, refreshUsageSnapshots } from "./usage";
 
 export async function handleGetDashboard() {
   const [plans, usage, activeTargets, status] = await Promise.all([

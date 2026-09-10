@@ -15,14 +15,14 @@ import {
   patchOpenCodeAuth,
   patchOpenCodeConfig,
   applyPlanToTarget,
-} from "../config.server";
+} from "../server/config";
 import {
   modelCapabilityParameters,
   type ModelCapabilityField,
   type ModelCapabilityParameters,
-} from "../model-capabilities.shared";
-import type { Plan } from "../plans.shared";
-import { PlanStore, type PlanSecret } from "../store.server";
+} from "../shared/model-capabilities";
+import type { Plan } from "../shared/plans";
+import { PlanStore, type PlanSecret } from "../server/store";
 
 // The apply tests exercise real file writes; content-injection env vars set by
 // a hosting editor (e.g. an opencode-managed session) make applyOpenCode refuse

@@ -22,7 +22,7 @@
 
 ## 安装
 
-要求 Paseo 0.6.1、Node.js 20 或更高版本。
+要求 Paseo 0.8.x（daemon 和客户端均至少为 0.8.0）、Node.js 20 或更高版本。不支持 Paseo 0.7 及更早版本。
 
 ```bash
 npm install
@@ -194,6 +194,19 @@ secrets/<plan>.json # OAuth / API Key
 
 ## 开发
 
+使用 `@getpaseo/plugin` / `@getpaseo/client` 0.8.0 官方类型。插件采用独立运行时入口：
+
+```text
+index.client.tsx  # 注册右侧面板和 Command Center 操作
+index.server.ts   # 注册 daemon RPC handlers
+client/           # React Native 界面和客户端 hooks
+server/           # 配置写入、凭据存储和用量请求
+shared/           # RPC contracts、schema 和模型能力数据
+tests/            # Node 测试，不进入插件运行时 bundle
+```
+
+共享 RPC 的 `defineRpc` 从 `@getpaseo/plugin` 导入，客户端 hooks 和类型从 `@getpaseo/plugin/client` 导入，服务端上下文从 `@getpaseo/plugin/server` 导入。运行时代码必须留在对应目录内；不保留旧 `index.ts` 或本地 SDK 类型补丁。TypeScript 不引入 DOM library，以便发现客户端误用浏览器 API。
+
 ```bash
 npm run typecheck
 npm test
@@ -203,7 +216,8 @@ npm test
 
 ## 参考实现
 
-- [Paseo plugin reference](https://paseo.sh/docs/plugins/reference)
+- [Paseo 0.8 plugin reference](https://paseo.sh/docs/plugins/v0.8/reference)
+- [Paseo 0.8 migration guide](https://paseo.sh/docs/plugins/v0.8/migration)
 - [vscode-glm-plan-usage-plugin](https://github.com/sage-z-cn/vscode-glm-plan-usage-plugin)
 - [kimi-usage](https://github.com/Kayuii/kimi-usage)
 - [openai-oauth-copilot-chat](https://github.com/grikomsn/openai-oauth-copilot-chat)

@@ -10,7 +10,7 @@ import type {
   Target,
   UsageSnapshot,
   ZhipuRegion,
-} from "./plans.shared";
+} from "../shared/plans";
 import {
   atomicWriteFile,
   captureFile,
@@ -22,7 +22,7 @@ import {
   paseoCodingPlanHome,
   readTextIfExists,
   restoreFile,
-} from "./file-utils.server";
+} from "./file-utils";
 
 interface StoreState {
   version: 5;

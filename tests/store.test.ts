@@ -3,9 +3,9 @@ import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { DEFAULT_MAX_FILE_BYTES } from "../file-utils.server";
-import type { ActiveTargets, Plan, Provider, Target, UsageSnapshot } from "../plans.shared";
-import { PlanStore } from "../store.server";
+import { DEFAULT_MAX_FILE_BYTES } from "../server/file-utils";
+import type { ActiveTargets, Plan, Provider, Target, UsageSnapshot } from "../shared/plans";
+import { PlanStore } from "../server/store";
 
 function storedPlan(id: string, provider: Provider): Plan {
   return {

@@ -4,7 +4,7 @@ import { connect } from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 import { fetch as undiciFetch } from "undici";
-import { UsageDispatcherPool, usageProxyConfigured } from "../usage.server";
+import { UsageDispatcherPool, usageProxyConfigured } from "../server/usage";
 
 async function listen(server: Server): Promise<number> {
   server.listen(0, "127.0.0.1");

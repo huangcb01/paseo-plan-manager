@@ -14,8 +14,8 @@ import {
 } from "jsonc-parser/lib/esm/main.js";
 import { parse as parseToml } from "smol-toml";
 import { isMap, parseDocument, Scalar, type Document, type Pair, type ParsedNode, type YAMLMap } from "yaml";
-import type { Plan, Target } from "./plans.shared";
-import { targetModelParameterFields } from "./plans.shared";
+import type { Plan, Target } from "../shared/plans";
+import { targetModelParameterFields } from "../shared/plans";
 import {
   CLAUDE_AUTO_COMPACT_MIN,
   CLAUDE_AUTO_COMPACT_MAX,
@@ -26,7 +26,7 @@ import {
   type CapabilityProvider,
   type ModelCapabilityParameters,
   type ModelParameterPatch,
-} from "./model-capabilities.shared";
+} from "../shared/model-capabilities";
 import {
   atomicWriteFile,
   captureFile,
@@ -35,7 +35,7 @@ import {
   parseJsonObject,
   readTextIfExists,
   restoreFile,
-} from "./file-utils.server";
+} from "./file-utils";
 import {
   codexAccountId,
   codexGeneration,
@@ -47,7 +47,7 @@ import {
   type PlanSecret,
   type PlanStore,
   planStore,
-} from "./store.server";
+} from "./store";
 
 interface ToolStatus {
   installed: boolean;

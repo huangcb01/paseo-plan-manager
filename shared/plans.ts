@@ -1,10 +1,10 @@
-import { defineRpc } from "@getpaseo/plugin/server";
+import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 import {
   CLAUDE_AUTO_COMPACT_MAX,
   isKnownCapabilityModel,
   ModelParameterOverrideSchema,
-} from "./model-capabilities.shared";
+} from "./model-capabilities";
 
 export const ProviderSchema = z.enum(["codex", "zhipu", "kimi"]);
 export const TargetSchema = z.enum(["opencode", "codex", "claude", "ohmypi"]);

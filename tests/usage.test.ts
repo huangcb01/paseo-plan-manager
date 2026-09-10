@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { PlanStore } from "../store.server";
+import { PlanStore } from "../server/store";
 import {
   appendKimiQuotaHistory,
   normalizeCodexUsage,
@@ -12,7 +12,7 @@ import {
   normalizeZhipuTokenActivity,
   normalizeZhipuUsage,
   refreshUsageSnapshots,
-} from "../usage.server";
+} from "../server/usage";
 
 test("normalizes Codex primary, secondary, and additional windows", () => {
   const result = normalizeCodexUsage(
